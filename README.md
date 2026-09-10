@@ -88,8 +88,9 @@ commandcode/
 
 Notes:
 
+- **The menu is reprinted after every command's output**, so you never have to scroll back up to pick the next option.
 - **Model list provenance is labeled honestly**: on success it shows `数据来源: Provider API`; on failure (invalid key 401, network error, `useProviderModels` disabled) it states the reason and makes clear the listed entries are the **built-in reference list**, which may contain models your plan cannot use.
-- **API key resolution order**: `CC_API_KEY` / `COMMANDCODE_API_KEY` env → project `config.json` `apiKey` → menu `[4]`. Request-side auth (`Authorization` / `x-api-key`) is unchanged and independent of the console.
+- **API key resolution order**: `CC_API_KEY` / `COMMANDCODE_API_KEY` env → project `config.local.json` → `config.json` → menu `[4]`. Request-side auth (`Authorization` / `x-api-key`) is unchanged and independent of the console. If a terminal paste repeats the same key several times, the copies are collapsed into one (with an explicit notice) instead of saving one giant invalid key.
 - **Nothing is written to your C: drive**: the console itself creates no files (readline history is memory-only). Only when you answer `y` in menu `[4]` is the key written to `config.local.json` **inside the project directory** (excluded via `.gitignore` / `.dockerignore`, so it is never committed or baked into an image) — never `%APPDATA%`, `%TEMP%`, your home directory or the registry.
 - **Logs never shred the prompt**: runtime logs and upstream errors clear the current input line, print, then redraw `请输入序号 >`.
 - **Clean exit**: shutdown waits for in-flight upstream requests and drains stdout, avoiding an abrupt exit that trips a libuv assertion on Windows (exit code `0xC0000409`).

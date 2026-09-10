@@ -23,6 +23,7 @@ const PLAN_MODELS = [
   { id: 'xiaomi/mimo-v2.5', name: 'MiMo V2.5' },
 ];
 const BAD_KEY = 'user_badkey999';
+const MENU_MARK = '[0] 退出（停止代理）';
 
 // ── Mock 上游 ─────────────────────────────────────────
 const mockRequests = { provider: 0, badKey: 0 };
@@ -106,6 +107,12 @@ function runProxy({ apiKey, steps, timeoutMs = 30000 }) {
 
 // ── 场景 ─────────────────────────────────────────────
 const configBefore = fs.readFileSync(CONFIG_PATH, 'utf8');
+// config.local.json 可能存着用户真实的 Key —— 测试只做"快照 + 还原"，绝不破坏它
+const localBefore = fs.existsSync(LOCAL_CONFIG_PATH) ? fs.readFileSync(LOCAL_CONFIG_PATH, 'utf8') : null;
+function restoreLocalConfig() {
+  if (localBefore === null) fs.rmSync(LOCAL_CONFIG_PATH, { force: true });
+  else fs.writeFileSync(LOCAL_CONFIG_PATH, localBefore, 'utf8');
+}
 
 async function main() {
   await new Promise((r) => mock.listen(MOCK_PORT, '127.0.0.1', r));
@@ -128,6 +135,11 @@ async function main() {
   check(a.out.includes('服务状态与配置') && a.out.includes('已处理请求'), '菜单 [3] 服务状态');
   check(a.out.includes('最近日志'), '菜单 [5] 最近日志');
   check(a.out.includes('请输入序号 >'), '主菜单提示符');
+  // 输出会滚动追加，菜单必须每次输出完再摆一遍，否则用户得往上翻
+  const menuCount = a.out.split(MENU_MARK).length - 1;
+  check(menuCount >= 4, `每次输出后重印菜单（全文 ${menuCount} 次：初始 + 模型列表 + 状态 + 日志）`);
+  check(a.out.lastIndexOf(MENU_MARK) > a.out.lastIndexOf('最近日志（缓存'), '最后一次菜单在日志输出之后');
+  check(a.out.lastIndexOf(MENU_MARK) > a.out.lastIndexOf('当前套餐可用模型（共 3 个）'), '菜单在模型列表之后');
   check(!a.out.includes('user_tuitest123'), '❌ 日志/界面未泄露完整 API Key');
   check(mockRequests.provider >= 1, '已向 Provider API 拉取模型');
 
@@ -170,34 +182,35 @@ async function main() {
 
   const configAfter = fs.readFileSync(CONFIG_PATH, 'utf8');
   check(configBefore === configAfter, 'config.json 未被改动（本次测试全程不落盘）');
-  check(!fs.existsSync(LOCAL_CONFIG_PATH), '选择 n 时不创建 config.local.json');
+  const localNow = fs.existsSync(LOCAL_CONFIG_PATH) ? fs.readFileSync(LOCAL_CONFIG_PATH, 'utf8') : null;
+  check(localNow === localBefore, '选择 n 时不新建/不改动 config.local.json');
 
-  // D. 菜单 [4] 输入 Key 并选择写入 → 落到 config.local.json（git/镜像已排除），随后清理
-  if (fs.existsSync(LOCAL_CONFIG_PATH)) {
-    console.log('\n场景 D：跳过（已存在 config.local.json，不覆盖你的本地文件）');
-  } else {
-    console.log('\n场景 D：菜单 [4] 手输 Key · 选择 y 持久化到 config.local.json');
-    const typedKey2 = 'user_typedkey888';
-    const d = await runProxy({
-      apiKey: '',
-      steps: [
-        { waitFor: '请输入序号', send: '4\n' },
-        { waitFor: '粘贴 API Key', send: `${typedKey2}\n` },
-        { waitFor: '是否写入 config.local.json', send: 'y\n' },
-        { waitFor: '已在 .gitignore / .dockerignore 中排除', send: '0\n' },
-      ],
-    });
-    check(d.code === 0, '退出码 0', `实际 ${d.code}\n${tail(d.out)}`);
-    check(fs.existsSync(LOCAL_CONFIG_PATH), '已写入 config.local.json');
-    let saved = {};
-    try { saved = JSON.parse(fs.readFileSync(LOCAL_CONFIG_PATH, 'utf8')); } catch {}
-    check(saved.apiKey === typedKey2, 'config.local.json 里是正确的 Key');
-    check(fs.readFileSync(CONFIG_PATH, 'utf8') === configBefore, 'config.json 依然未被改动');
-    check(fs.readFileSync(path.join(ROOT, '.gitignore'), 'utf8').includes('config.local.json'), '.gitignore 已排除 config.local.json');
-    check(fs.readFileSync(path.join(ROOT, '.dockerignore'), 'utf8').includes('config.local.json'), '.dockerignore 已排除 config.local.json');
-    fs.rmSync(LOCAL_CONFIG_PATH, { force: true });
-    check(!fs.existsSync(LOCAL_CONFIG_PATH), '测试已清理 config.local.json');
-  }
+  // D. 菜单 [4] 输入 Key 并选择写入 → 落到 config.local.json（git/镜像已排除），结束还原
+  console.log('\n场景 D：菜单 [4] 手输 Key · 重复粘贴自动合并 + 选择 y 持久化');
+  const typedKey2 = 'user_typedkey888';
+  const d = await runProxy({
+    apiKey: '',
+    steps: [
+      { waitFor: '请输入序号', send: '4\n' },
+      // 模拟终端里连续粘贴 3 次同一把 Key（真实踩过的坑：贪婪正则会把它们粘成一把超长 Key）
+      { waitFor: '粘贴 API Key', send: `${typedKey2}${typedKey2}${typedKey2}\n` },
+      { waitFor: '是否写入 config.local.json', send: 'y\n' },
+      { waitFor: '已在 .gitignore / .dockerignore 中排除', send: '0\n' },
+    ],
+  });
+  check(d.code === 0, '退出码 0', `实际 ${d.code}\n${tail(d.out)}`);
+  check(d.out.includes('检测到连续粘贴了多份相同的 Key'), '提示了重复粘贴并自动合并');
+  check(fs.existsSync(LOCAL_CONFIG_PATH), '已写入 config.local.json');
+  let saved = {};
+  try { saved = JSON.parse(fs.readFileSync(LOCAL_CONFIG_PATH, 'utf8')); } catch {}
+  check(saved.apiKey === typedKey2, '存下去的是合并后的单份 Key', `实际 ${String(saved.apiKey).slice(0, 40)}…`);
+  check(fs.readFileSync(CONFIG_PATH, 'utf8') === configBefore, 'config.json 依然未被改动');
+  check(fs.readFileSync(path.join(ROOT, '.gitignore'), 'utf8').includes('config.local.json'), '.gitignore 已排除 config.local.json');
+  check(fs.readFileSync(path.join(ROOT, '.dockerignore'), 'utf8').includes('config.local.json'), '.dockerignore 已排除 config.local.json');
+
+  restoreLocalConfig();
+  const restored = fs.existsSync(LOCAL_CONFIG_PATH) ? fs.readFileSync(LOCAL_CONFIG_PATH, 'utf8') : null;
+  check(restored === localBefore, localBefore === null ? '测试已清理 config.local.json' : '已还原用户原有的 config.local.json');
 
   await new Promise((r) => mock.close(r));
   console.log(failures === 0 ? '\n全部通过 ✅' : `\n失败 ${failures} 项 ❌`);

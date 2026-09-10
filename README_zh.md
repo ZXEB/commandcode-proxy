@@ -88,8 +88,9 @@ commandcode/
 
 要点：
 
+- **每次操作输出完会自动重新打印一遍菜单**，列表/日志滚过屏幕后不用往上翻就能接着选。
 - **模型列表来源如实标注**：成功时显示 `数据来源: Provider API`；失败（Key 无效 401、网络错误、关闭了 `useProviderModels`）会明确提示原因，并说明下面列的是**内置参考列表**，可能包含当前套餐不可用的模型。
-- **API Key 解析顺序**：环境变量 `CC_API_KEY` / `COMMANDCODE_API_KEY` → 项目内 `config.json` 的 `apiKey` → 菜单 `[4]` 手动输入。请求侧（`Authorization` / `x-api-key`）仍然照旧，与控制台无关。
+- **API Key 解析顺序**：环境变量 `CC_API_KEY` / `COMMANDCODE_API_KEY` → 项目内 `config.local.json` → `config.json` → 菜单 `[4]` 手动输入。请求侧（`Authorization` / `x-api-key`）仍然照旧，与控制台无关。终端里连续粘贴多份相同的 Key 会自动合并为一份（会明确提示），不会存成一把超长废 Key。
 - **不写 C 盘**：控制台自身不落任何文件（readline 历史仅存在内存里）；只有你在菜单 `[4]` 里选择 `y` 时，才会把 Key 写进**项目目录内**的 `config.local.json`（该文件已在 `.gitignore` / `.dockerignore` 里排除，不会被提交或打进镜像）。不会碰 `%APPDATA%` / `%TEMP%` / 家目录 / 注册表。
 - **日志不撕界面**：代理运行日志、上游错误都会先清掉当前输入行再打印，然后重绘 `请输入序号 >`，可以边跑边看日志。
 - **退出干净**：退出前会等在途的上游请求收尾并排空 stdout，避免 Windows 上硬退撞 libuv 断言（退出码 `0xC0000409`）。

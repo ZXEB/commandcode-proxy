@@ -2263,9 +2263,24 @@ function maskKey(key) {
   return key.length <= 12 ? `${key.slice(0, 5)}****` : `${key.slice(0, 5)}****${key.slice(-4)}`;
 }
 
+// 从任意文本里取出 API Key。
+// 注意：`user_[a-zA-Z0-9_-]+` 是贪婪的，终端里连续粘贴同一把 Key 会粘成
+// "user_Auser_Auser_A…"，被整体当成一把 Key（实测踩过）。这里检测"各段完全相同"
+// 时折叠成一份；只在完全相同时才折叠，避免误伤本身含 "user_" 字样的合法 Key。
 function sanitizeApiKey(raw) {
   const m = String(raw || '').match(/user_[a-zA-Z0-9_-]+/);
-  return m ? m[0] : '';
+  if (!m) return '';
+  const parts = m[0].split('user_').filter(Boolean);
+  if (parts.length > 1 && parts.every((p) => p === parts[0])) return `user_${parts[0]}`;
+  return m[0];
+}
+
+// 判断这次输入是否属于"重复粘贴"，用于给用户一句明确提示
+function isRepeatedPaste(raw) {
+  const m = String(raw || '').match(/user_[a-zA-Z0-9_-]+/);
+  if (!m) return false;
+  const parts = m[0].split('user_').filter(Boolean);
+  return parts.length > 1 && parts.every((p) => p === parts[0]);
 }
 
 // 日志 / 异步输出都经过这里：先清掉当前输入行，再打印，最后重绘提示符。
@@ -2424,6 +2439,7 @@ async function tuiSetApiKey() {
 
   if (!typed) { tuiWriteAbovePrompt(paint('已取消', ANSI.dim)); return; }
 
+  const repeated = isRepeatedPaste(typed);
   const key = sanitizeApiKey(typed);
   if (!key) {
     tuiWriteAbovePrompt(paint('❌ 格式不对：Key 必须以 user_ 开头，例如 user_xxxxxxxxx', ANSI.red));
@@ -2433,6 +2449,9 @@ async function tuiSetApiKey() {
   TUI.apiKeySource = '手动输入（本次运行）';
   resetModelCache(); // 换 Key = 换套餐，旧列表作废
   tuiWriteAbovePrompt(paint(`✅ 已启用 API Key ${maskKey(key)}`, ANSI.green));
+  if (repeated) {
+    tuiWriteAbovePrompt(paint(`ℹ️  检测到连续粘贴了多份相同的 Key，已自动合并为一份（${key.length} 字符）`, ANSI.yellow));
+  }
 
   const answer = (await tuiAsk('是否写入 config.local.json（项目目录内，不入库/不进镜像）供下次自动使用？(y/N) > ')).toLowerCase();
   if (answer === 'y' || answer === 'yes') {
@@ -2462,7 +2481,20 @@ function tuiShowLogs() {
 // [6] 清屏
 function tuiClearScreen() {
   process.stdout.write('\x1b[2J\x1b[3J\x1b[H');
-  tuiWriteAbovePrompt(`${tuiHeader()}\n${tuiMenu()}`);
+  tuiWriteAbovePrompt(`${tuiHeader()}\n${tuiMenu()}`); // 已自带提示符重绘
+}
+
+// 一次操作结束后重新摆出菜单 + 提示符。
+// 命令的输出是往终端里"滚动追加"的，滚过几屏之后菜单就看不见了，
+// 所以每次输出完都把菜单再打一遍，用户不用往上翻。
+function tuiReprompt({ menu = true } = {}) {
+  if (TUI.closing || !TUI.rl) return;
+  TUI.rl.setPrompt(TUI_MAIN_PROMPT);
+  if (menu) {
+    tuiWriteAbovePrompt('\n' + tuiMenu()); // 内部会重绘提示符
+    return;
+  }
+  TUI.rl.prompt();
 }
 
 // 等 stdout 写缓冲排空（管道重定向下 stdout 是异步的）
@@ -2514,7 +2546,7 @@ async function tuiHandleLine(raw) {
     case '3': tuiShowStatus(); break;
     case '4': await tuiSetApiKey(); break;
     case '5': tuiShowLogs(); break;
-    case '6': tuiClearScreen(); break;
+    case '6': tuiClearScreen(); return; // 已重绘菜单 + 提示符，不再重复
     case '0':
     case 'q':
     case 'Q':
@@ -2525,8 +2557,7 @@ async function tuiHandleLine(raw) {
       tuiWriteAbovePrompt(paint(`未知序号「${line}」—— 请输入 0-6`, ANSI.yellow));
   }
 
-  TUI.rl.setPrompt(TUI_MAIN_PROMPT);
-  TUI.rl.prompt();
+  tuiReprompt(); // 输出完再摆一次菜单
 }
 
 function startTui() {
@@ -2587,14 +2618,17 @@ function startTui() {
   process.stdout.write(`${tuiHeader()}\n${tuiMenu()}\n`);
   if (!TUI.apiKey) {
     process.stdout.write(paint('提示：尚未设置 API Key，按 [4] 设置后才能看到当前套餐的模型列表。\n', ANSI.yellow));
-  } else {
-    process.stdout.write(paint('正在读取当前套餐可用模型…\n', ANSI.dim));
   }
   rl.setPrompt(TUI_MAIN_PROMPT);
   rl.prompt();
 
-  // 启动即自动展示一次当前套餐可用模型（命中 5 分钟缓存时不再打接口）
-  if (TUI.apiKey) TUI.queue = TUI.queue.then(() => tuiShowModels(false));
+  // 启动即自动展示一次当前套餐可用模型（命中 5 分钟缓存时不再打接口），
+  // 展示完再把菜单摆回来
+  if (TUI.apiKey) {
+    TUI.queue = TUI.queue
+      .then(() => tuiShowModels(false))
+      .then(() => tuiReprompt());
+  }
 }
 
 // ── 服务器 ──────────────────────────────────────────
@@ -2631,6 +2665,11 @@ const server = http.createServer(async (req, res) => {
     sendJSON(res, 500, { error: { message: e.message, type: 'internal_error' } });
   }
 });
+
+// 管道下游提前退出（`node proxy.mjs | more`、终端被关闭等）时不要因为 EPIPE 崩掉
+for (const stream of [process.stdout, process.stderr]) {
+  stream.on('error', (e) => { if (e && e.code !== 'EPIPE') throw e; });
+}
 
 // 全局兜底：abort 触发的异步 rejection 不会让进程崩溃
 process.on('unhandledRejection', (reason) => {

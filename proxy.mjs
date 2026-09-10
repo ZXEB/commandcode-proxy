@@ -5,9 +5,10 @@
 import http from 'http';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
-import { readFileSync, existsSync, appendFileSync } from 'fs';
+import { readFileSync, existsSync, appendFileSync, writeFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { createInterface } from 'readline';
 
 // ── 配置加载 ──────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -34,6 +35,18 @@ function loadConfig() {
     }
   }
 
+  // 本地覆盖（控制台保存的 API Key 等）。该文件不入库、不进镜像，
+  // 避免 API Key 被误提交或误打进容器镜像。
+  const localPath = resolve(__dirname, 'config.local.json');
+  if (existsSync(localPath)) {
+    try {
+      const local = JSON.parse(readFileSync(localPath, 'utf-8'));
+      Object.assign(defaults, local);
+    } catch (e) {
+      console.error('[config] Failed to parse config.local.json:', e.message);
+    }
+  }
+
   // 环境变量覆写
   if (process.env.PORT) defaults.port = parseInt(process.env.PORT);
   if (process.env.HOST) defaults.host = process.env.HOST;
@@ -46,6 +59,17 @@ function loadConfig() {
 }
 
 const CFG = loadConfig();
+
+// 在途上游请求登记表。退出前要等它们收尾：在 undici 异步 handle 关闭途中
+// 调用 process.exit()，Windows 上会撞 libuv 断言（0xC0000409）直接崩。
+const inflightOps = new Set();
+function track(op) {
+  const p = Promise.resolve(op);
+  inflightOps.add(p);
+  const done = () => inflightOps.delete(p);
+  p.then(done, done);
+  return p;
+}
 
 // ── 指纹生成（首次运行自动生成，写回 config.json） ──────
 // CPU 型号与核心数对应表（仅 Windows x64）
@@ -123,7 +147,11 @@ const CC_VERSION_FALLBACK = '0.32.3';
 const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — npm registry 刷新间隔
 
 // ── 动态 CC 版本号（从 npm registry 拉取） ─────────────
-async function refreshCCVersion() {
+function refreshCCVersion() {
+  return track(doRefreshCCVersion());
+}
+
+async function doRefreshCCVersion() {
   try {
     const url = 'https://registry.npmjs.org/command-code/latest';
     const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
@@ -138,7 +166,7 @@ async function refreshCCVersion() {
   }
 }
 refreshCCVersion(); // 启动时立即拉取
-setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
+const ccVersionTimer = setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
 
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB — 请求体大小上限
 const STREAM_IDLE_TIMEOUT_MS = 90000;   // 90s — 流式无新数据中断（thinking/排队期上游常静默超过 30s，30s 会掐断还活着的流）
@@ -150,9 +178,31 @@ let consecutiveTimeouts = 0;
 const TIMEOUT_REDUCE_CONTEXT_THRESHOLD = 3;
 
 // ── 日志 ─────────────────────────────────────────────
+const LOG_RING_SIZE = 300;
+const logRing = []; // 最近日志（内存环形缓冲，控制台 [5] 可查看；不落盘）
+
+// 控制台状态对象。提前声明，log() 才能安全引用；
+// 具体实现见文件末尾「交互式控制台（cmd TUI）」章节。
+const TUI = {
+  active: false,        // 是否已进入交互模式
+  startedAt: Date.now(),
+  rl: null,             // readline 实例
+  queue: Promise.resolve(), // 命令串行队列（保证输出顺序）
+  pending: null,        // 正在等待的一次输入
+  maskInput: false,     // 隐藏回显（输入 API Key 时）
+  closing: false,
+  apiKey: '',
+  apiKeySource: '',
+};
+
+const stats = { requests: 0, errors: 0 };
+
 function log(level, msg, data) {
   const line = `[${new Date().toISOString()}] [${level}] ${msg}${data ? ' ' + JSON.stringify(data) : ''}`;
-  console.log(line);
+  logRing.push(line);
+  if (logRing.length > LOG_RING_SIZE) logRing.shift();
+  if (TUI.active) tuiWriteAbovePrompt(formatLogLine(line, level));
+  else console.log(line);
   if (CFG.logFile) {
     try { appendFileSync(CFG.logFile, line + '\n', 'utf-8'); } catch {}
   }
@@ -183,7 +233,7 @@ function ensureSession(apiKey) {
 }
 
 // 定期清理过期 session 和 key 状态，防止 Map 无限增长
-setInterval(() => {
+const sessionCleanupTimer = setInterval(() => {
   const now = Date.now();
   let cleaned = 0;
   for (const [key, entry] of sessionStore) {
@@ -234,6 +284,10 @@ const INIT_REFRESH_MS = 8 * 60 * 60 * 1000;    // 8h
 const INIT_JITTER_MS  = 2 * 60 * 60 * 1000;    // 2h 抖动
 
 async function ensureInitialized(apiKey, signal) {
+  return track(doEnsureInitialized(apiKey, signal));
+}
+
+async function doEnsureInitialized(apiKey, signal) {
   const state = getOrCreateKeyState(apiKey);
   const now = Date.now();
   if (now < state.nextInitAt) return;
@@ -754,6 +808,10 @@ function getApiKey(headers) {
 // ── 流式转发 ────────────────────────────────────────
 
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal) {
+  return track(doForwardToCC(body, apiKey, incomingHeaders, signal));
+}
+
+async function doForwardToCC(body, apiKey, incomingHeaders = {}, signal) {
   const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
   const sessionId = getSessionId(incomingHeaders, apiKey);
@@ -2055,15 +2113,24 @@ async function handleMessages(req, res) {
 
 let dynamicModels = null;
 let modelsLastFetch = 0;
+let modelsSource = 'builtin';  // 'provider' = 当前套餐实时列表（Provider API）| 'builtin' = 内置回退列表
+let modelsLastError = '';      // 回退原因（供控制台如实提示，避免把内置列表当成套餐列表）
 
-async function fetchModels(apiKey) {
+// apiKey 对应「当前套餐」；force=true 跳过 5 分钟缓存强制重新拉取
+async function fetchModels(apiKey, opts = {}) {
+  return track(doFetchModels(apiKey, opts));
+}
+
+async function doFetchModels(apiKey, { force = false } = {}) {
   const now = Date.now();
-  if (dynamicModels && (now - modelsLastFetch) < CFG.modelRefreshIntervalMs) {
+  if (!force && dynamicModels && (now - modelsLastFetch) < CFG.modelRefreshIntervalMs) {
+    modelsSource = 'provider';
     return dynamicModels;
   }
 
   try {
-    if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
+    if (!apiKey) throw new Error('未提供 API Key');
+    if (!CFG.useProviderModels) throw new Error('已关闭 useProviderModels');
 
     const response = await fetch(`${CFG.apiBase}/provider/v1/models`, {
       headers: {
@@ -2077,21 +2144,30 @@ async function fetchModels(apiKey) {
     if (response.ok) {
       const data = await response.json();
       if (Array.isArray(data.data)) {
-        dynamicModels = data.data.map(m => ({
-          id: m.id,
-          name: m.id,
-        }));
+        // 兼容两种返回：字符串数组 / { id, name } 对象数组
+        dynamicModels = data.data
+          .map(m => (typeof m === 'string' ? { id: m, name: m } : { id: m && m.id, name: (m && (m.name || m.id)) }))
+          .filter(m => m.id);
         modelsLastFetch = now;
+        modelsSource = 'provider';
+        modelsLastError = '';
         log('info', 'Fetched models from Provider API', { count: dynamicModels.length });
         return dynamicModels;
       }
+      modelsLastError = 'Provider API 返回格式异常';
+    } else {
+      modelsLastError = response.status === 401
+        ? 'API Key 无效或已过期（HTTP 401）'
+        : `Provider API 返回 HTTP ${response.status}`;
     }
     log('warn', 'Provider models fetch failed, using hardcoded list', { status: response.status });
   } catch (e) {
+    modelsLastError = e.message;
     log('warn', 'Provider models fetch error, using hardcoded list', { error: e.message });
   }
 
   // Fallback to hardcoded MODELS
+  modelsSource = 'builtin';
   return MODELS;
 }
 
@@ -2115,6 +2191,412 @@ function handleHealth(req, res) {
   res.end('OK');
 }
 
+// ══ 交互式控制台（cmd TUI） ═══════════════════════════
+// 设计约束：
+//  1. 纯 Node 内置模块（readline），零外部依赖，保持单文件分发；
+//  2. 所有持久化只写项目目录内的 config.json —— 绝不写 %APPDATA% / %TEMP% /
+//     家目录 / 注册表等任何 C 盘位置（TUI 自身不落任何文件）；
+//  3. stdout 不是 TTY（Docker / CI / 重定向）时自动关闭，行为与旧版完全一致，
+//     可用 CC_TUI=1 或 --tui 强制开启（测试用），CC_TUI=0 / --no-tui 强制关闭。
+
+const ANSI = {
+  reset: '\x1b[0m',
+  bold: '\x1b[1m',
+  dim: '\x1b[2m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  cyan: '\x1b[36m',
+};
+
+const TUI_MAIN_PROMPT = '请输入序号 > ';
+const TUI_KEY_PROMPT = '粘贴 API Key（user_ 开头，直接回车取消）> ';
+
+function resolveTuiMode() {
+  const argv = process.argv.slice(2);
+  if (argv.includes('--no-tui')) return false;
+  if (argv.includes('--tui')) return true;
+  const env = (process.env.CC_TUI || '').trim().toLowerCase();
+  if (['0', 'off', 'no', 'false'].includes(env)) return false;
+  if (['1', 'on', 'yes', 'true', 'force'].includes(env)) return true;
+  return !!process.stdout.isTTY;
+}
+
+// 仅在 TTY 下上色；非交互（管道 / 日志重定向）保持纯文本，避免污染日志
+function useColor() {
+  return !process.env.NO_COLOR && (!!process.stdout.isTTY || process.env.CC_TUI_COLOR === '1');
+}
+
+function paint(text, ...codes) {
+  return useColor() ? codes.join('') + text + ANSI.reset : text;
+}
+
+// 计算终端显示宽度（CJK 全角字符算 2 列）
+function dispWidth(s) {
+  let w = 0;
+  for (const ch of String(s)) {
+    w += /[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE6F\uFF00-\uFF60\uFFE0-\uFFE6]/.test(ch) ? 2 : 1;
+  }
+  return w;
+}
+
+function padEndW(s, width) {
+  return String(s) + ' '.repeat(Math.max(0, width - dispWidth(s)));
+}
+
+function formatDuration(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return `${h ? h + 'h' : ''}${h || m ? m + 'm' : ''}${s}s`;
+}
+
+function formatLogLine(line, level) {
+  if (level === 'error') return paint(line, ANSI.red);
+  if (level === 'warn') return paint(line, ANSI.yellow);
+  return paint(line, ANSI.dim);
+}
+
+function maskKey(key) {
+  if (!key) return '(未设置)';
+  return key.length <= 12 ? `${key.slice(0, 5)}****` : `${key.slice(0, 5)}****${key.slice(-4)}`;
+}
+
+function sanitizeApiKey(raw) {
+  const m = String(raw || '').match(/user_[a-zA-Z0-9_-]+/);
+  return m ? m[0] : '';
+}
+
+// 日志 / 异步输出都经过这里：先清掉当前输入行，再打印，最后重绘提示符。
+// 这样上游日志、模型列表、keepalive 提示都不会把用户正在输入的那行撕碎。
+function tuiWriteAbovePrompt(text) {
+  if (!TUI.active || !TUI.rl) { process.stdout.write(text + '\n'); return; }
+  process.stdout.write('\r\x1b[2K' + text + '\n');
+  try { TUI.rl.prompt(true); } catch {}
+}
+
+// ── API Key 解析 / 持久化（只写项目目录） ──────────────
+function loadApiKeyFromSources() {
+  const envKey = sanitizeApiKey(process.env.CC_API_KEY || process.env.COMMANDCODE_API_KEY || '');
+  if (envKey) return { key: envKey, source: '环境变量 CC_API_KEY' };
+
+  // config.local.json 优先于 config.json（loadConfig 已合并，这里只为标注来源）
+  let localKey = '';
+  try {
+    const localPath = resolve(__dirname, 'config.local.json');
+    if (existsSync(localPath)) localKey = sanitizeApiKey(JSON.parse(readFileSync(localPath, 'utf-8')).apiKey);
+  } catch {}
+  if (localKey) return { key: localKey, source: 'config.local.json' };
+
+  const fileKey = sanitizeApiKey(CFG.apiKey);
+  if (fileKey) return { key: fileKey, source: 'config.json' };
+  return { key: '', source: '' };
+}
+
+// 只写项目目录内的 config.local.json —— 该文件已在 .gitignore / .dockerignore 中排除，
+// 避免 API Key 被误提交到 git 或被误打进镜像。
+function saveApiKeyLocally(key) {
+  const localPath = resolve(__dirname, 'config.local.json');
+  let obj = {};
+  try {
+    if (existsSync(localPath)) obj = JSON.parse(readFileSync(localPath, 'utf-8'));
+  } catch {}
+  obj.apiKey = key;
+  writeFileSync(localPath, JSON.stringify(obj, null, 2) + '\n', 'utf-8');
+  CFG.apiKey = key;
+  return localPath;
+}
+
+function resetModelCache() {
+  dynamicModels = null;
+  modelsLastFetch = 0;
+  modelsSource = 'builtin';
+  modelsLastError = '';
+}
+
+function tuiHeader() {
+  const rule = paint('─'.repeat(60), ANSI.dim);
+  return [
+    rule,
+    paint(' Command Code → OpenAI / Anthropic 代理 · 控制台', ANSI.bold, ANSI.cyan),
+    ` 服务 ${`http://${CFG.host}:${CFG.port}`} │ 运行 ${formatDuration(Date.now() - TUI.startedAt)} │ 已处理请求 ${stats.requests}`,
+    ` API Key ${maskKey(TUI.apiKey)} （来源: ${TUI.apiKeySource || '未设置'}）`,
+    rule,
+  ].join('\n');
+}
+
+function tuiMenu() {
+  const n = (s) => paint(`[${s}]`, ANSI.cyan);
+  return [
+    ` ${n(1)} 查看当前套餐可用模型`,
+    ` ${n(2)} 强制刷新模型列表（跳过 5 分钟缓存）`,
+    ` ${n(3)} 服务状态与配置`,
+    ` ${n(4)} 设置 / 更换 API Key`,
+    ` ${n(5)} 查看最近日志`,
+    ` ${n(6)} 清屏`,
+    ` ${n(0)} 退出（停止代理）`,
+  ].join('\n');
+}
+
+function tuiAsk(promptText) {
+  return new Promise((resolve) => {
+    TUI.pending = { resolve };
+    TUI.rl.setPrompt(promptText);
+    TUI.rl.prompt();
+  });
+}
+
+// ── 菜单动作 ────────────────────────────────────────
+// [1] / [2] 当前套餐可用模型
+async function tuiShowModels(force = false) {
+  if (!TUI.apiKey) {
+    tuiWriteAbovePrompt(paint('⚠️  还没有 API Key —— 请先按 [4] 设置（Key 必须以 user_ 开头）', ANSI.yellow));
+    return;
+  }
+  tuiWriteAbovePrompt(paint(force ? '正在重新拉取当前套餐可用模型…' : '正在读取当前套餐可用模型…', ANSI.dim));
+
+  const models = await fetchModels(TUI.apiKey, { force });
+  const fromProvider = modelsSource === 'provider';
+  const width = Math.max(4, ...models.map((m) => dispWidth(m.id)));
+
+  const out = ['', paint(`当前套餐可用模型（共 ${models.length} 个）`, ANSI.bold, ANSI.cyan)];
+  if (fromProvider) {
+    out.push(paint(
+      ` 数据来源: Provider API · ${new Date(modelsLastFetch).toLocaleTimeString()} 拉取 · 缓存 ${Math.round(CFG.modelRefreshIntervalMs / 60000)} 分钟`,
+      ANSI.dim,
+    ));
+  } else {
+    out.push(paint(` ⚠️  未能获取套餐模型（${modelsLastError || '未知原因'}）`, ANSI.yellow));
+    out.push(paint('     以下为内置参考列表，可能包含当前套餐不可用的模型；请按 [4] 设置有效 API Key 后重试。', ANSI.yellow));
+  }
+  out.push('');
+  out.push(paint(`  ${padEndW('#', 5)}${padEndW('模型 ID', width + 2)}备注`, ANSI.dim));
+  models.forEach((m, i) => {
+    const idx = padEndW(`${i + 1}.`, 5);
+    const name = m.name && m.name !== m.id ? m.name : '';
+    out.push(`  ${paint(idx, ANSI.green)}${padEndW(m.id, width + 2)}${name ? paint(name, ANSI.dim) : ''}`);
+  });
+  out.push('');
+  out.push(paint(' 提示：这些 ID 可直接填到客户端（Cursor / OpenCode / SDK）的 model 字段。', ANSI.dim));
+  out.push('');
+  tuiWriteAbovePrompt(out.join('\n'));
+}
+
+// [3] 服务状态与配置
+function tuiShowStatus() {
+  const cacheLeft = dynamicModels
+    ? `${dynamicModels.length} 个 · ${Math.max(0, Math.round((CFG.modelRefreshIntervalMs - (Date.now() - modelsLastFetch)) / 1000))}s 后过期`
+    : '未缓存';
+  const rows = [
+    ['监听地址', `http://${CFG.host}:${CFG.port}`],
+    ['运行时长', formatDuration(Date.now() - TUI.startedAt)],
+    ['上游 API', CFG.apiBase],
+    ['项目 Slug', CFG.projectSlug],
+    ['API Key', TUI.apiKey ? `${maskKey(TUI.apiKey)}（${TUI.apiKeySource}）` : '未设置'],
+    ['模型来源', modelsSource === 'provider' ? 'Provider API（当前套餐）' : '内置列表（回退）'],
+    ['模型缓存', cacheLeft],
+    ['已处理请求', `${stats.requests}（错误 ${stats.errors}）`],
+    ['日志文件', CFG.logFile || '仅控制台'],
+    ['日志级别', CFG.logLevel],
+    ['CLI 版本号', CC_VERSION],
+    ['持久化位置', '仅项目目录 config.local.json（已排除出 git / 镜像，不写 C 盘用户目录）'],
+  ];
+  const w = Math.max(...rows.map((r) => dispWidth(r[0])));
+  tuiWriteAbovePrompt([
+    '',
+    paint('服务状态与配置', ANSI.bold, ANSI.cyan),
+    ...rows.map(([k, v]) => `  ${padEndW(k, w + 2)}${v}`),
+    '',
+  ].join('\n'));
+}
+
+// [4] 设置 / 更换 API Key
+async function tuiSetApiKey() {
+  TUI.maskInput = true; // 输入期间不回显
+  let typed = '';
+  try {
+    typed = await tuiAsk(TUI_KEY_PROMPT);
+  } finally {
+    TUI.maskInput = false;
+  }
+  process.stdout.write('\x1b[1A\x1b[2K'); // 抹掉上一行（Key 不留在命令行/回滚缓冲里）
+
+  if (!typed) { tuiWriteAbovePrompt(paint('已取消', ANSI.dim)); return; }
+
+  const key = sanitizeApiKey(typed);
+  if (!key) {
+    tuiWriteAbovePrompt(paint('❌ 格式不对：Key 必须以 user_ 开头，例如 user_xxxxxxxxx', ANSI.red));
+    return;
+  }
+  TUI.apiKey = key;
+  TUI.apiKeySource = '手动输入（本次运行）';
+  resetModelCache(); // 换 Key = 换套餐，旧列表作废
+  tuiWriteAbovePrompt(paint(`✅ 已启用 API Key ${maskKey(key)}`, ANSI.green));
+
+  const answer = (await tuiAsk('是否写入 config.local.json（项目目录内，不入库/不进镜像）供下次自动使用？(y/N) > ')).toLowerCase();
+  if (answer === 'y' || answer === 'yes') {
+    try {
+      const p = saveApiKeyLocally(key);
+      TUI.apiKeySource = 'config.local.json';
+      tuiWriteAbovePrompt(paint(`✅ 已写入 ${p}（已在 .gitignore / .dockerignore 中排除）`, ANSI.green));
+    } catch (e) {
+      tuiWriteAbovePrompt(paint(`❌ 写入失败: ${e.message}`, ANSI.red));
+    }
+  } else {
+    tuiWriteAbovePrompt(paint('未写入文件，仅本次运行有效。', ANSI.dim));
+  }
+}
+
+// [5] 最近日志
+function tuiShowLogs() {
+  const lines = logRing.slice(-40);
+  tuiWriteAbovePrompt([
+    '',
+    paint(`最近日志（缓存 ${logRing.length} 条，显示最后 ${lines.length} 条）`, ANSI.bold, ANSI.cyan),
+    ...(lines.length ? lines.map((l) => '  ' + l) : [paint('  （暂无日志）', ANSI.dim)]),
+    '',
+  ].join('\n'));
+}
+
+// [6] 清屏
+function tuiClearScreen() {
+  process.stdout.write('\x1b[2J\x1b[3J\x1b[H');
+  tuiWriteAbovePrompt(`${tuiHeader()}\n${tuiMenu()}`);
+}
+
+// 等 stdout 写缓冲排空（管道重定向下 stdout 是异步的）
+async function drainStdout(timeoutMs = 500) {
+  const deadline = Date.now() + timeoutMs;
+  while ((process.stdout.writableLength || 0) > 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  await new Promise((r) => setTimeout(r, 50)); // 让最后一次 uv_write 落地
+}
+
+// [0] 退出
+async function tuiShutdown(reason) {
+  if (TUI.closing) return;
+  TUI.closing = true;
+  TUI.active = false;
+  process.stdout.write('\n' + paint(`正在停止代理（${reason}）…`, ANSI.dim) + '\n');
+
+  // 依次收摊：定时器 → 控制台 → 服务器（含空闲 keep-alive 连接）
+  clearInterval(ccVersionTimer);
+  clearInterval(sessionCleanupTimer);
+  try { TUI.rl && TUI.rl.close(); } catch {}
+  await new Promise((r) => { try { server.close(() => r()); } catch { r(); } });
+  try { server.closeIdleConnections && server.closeIdleConnections(); } catch {}
+
+  // 等在途的上游请求收尾（最多 1.2s）
+  await Promise.race([
+    Promise.allSettled([...inflightOps]),
+    new Promise((r) => setTimeout(r, 1200)),
+  ]);
+
+  // 让事件循环自然结束：不用 process.exit() 硬切 —— Windows 上在途的
+  // 线程池写入（stdout 管道）会撞 libuv 断言 0xC0000409，退出码变成 0xC0000409。
+  // stdin 是唯一还会吊住事件循环的 handle，主动 unref 释放。
+  try { process.stdin.pause(); process.stdin.unref && process.stdin.unref(); } catch {}
+  await drainStdout();
+
+  const forceExit = setTimeout(() => process.exit(0), 1500); // 兜底：还有别的 handle 吊着时才硬退
+  forceExit.unref();
+}
+
+async function tuiHandleLine(raw) {
+  const line = String(raw).trim();
+  if (!line) return;
+
+  switch (line) {
+    case '1': await tuiShowModels(false); break;
+    case '2': await tuiShowModels(true); break;
+    case '3': tuiShowStatus(); break;
+    case '4': await tuiSetApiKey(); break;
+    case '5': tuiShowLogs(); break;
+    case '6': tuiClearScreen(); break;
+    case '0':
+    case 'q':
+    case 'Q':
+    case 'exit':
+      await tuiShutdown('用户退出');
+      return;
+    default:
+      tuiWriteAbovePrompt(paint(`未知序号「${line}」—— 请输入 0-6`, ANSI.yellow));
+  }
+
+  TUI.rl.setPrompt(TUI_MAIN_PROMPT);
+  TUI.rl.prompt();
+}
+
+function startTui() {
+  const { key, source } = loadApiKeyFromSources();
+  TUI.apiKey = key;
+  TUI.apiKeySource = source;
+  TUI.active = true;
+  TUI.startedAt = Date.now();
+
+  const rl = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: true,
+    historySize: 100,           // 仅内存，不写 .node_repl_history 等任何文件
+    removeHistoryDuplicates: true,
+  });
+  TUI.rl = rl;
+
+  // 输入 API Key 时屏蔽回显（只放行提示语本身；私有 API 缺失时退化为可见输入）
+  if (typeof rl._writeToOutput === 'function') {
+    const origWrite = rl._writeToOutput.bind(rl);
+    rl._writeToOutput = (str) => {
+      if (!TUI.maskInput) return origWrite(str);
+      if (str.includes(TUI_KEY_PROMPT)) return origWrite(str);
+    };
+  }
+
+  // 命令串行执行：await 中的命令（如拉取模型）不会被后续按键插队。
+  // 例外：正在等待一次输入（API Key / y-N 确认）时必须就地结算，
+  // 否则「等待输入」的命令会堵住队列、输入行永远进不来（死锁）。
+  rl.on('line', (l) => {
+    if (TUI.pending) {
+      const { resolve } = TUI.pending;
+      TUI.pending = null;
+      resolve(String(l).trim());
+      return;
+    }
+    TUI.queue = TUI.queue
+      .then(() => tuiHandleLine(l))
+      .catch((e) => tuiWriteAbovePrompt(paint(`❌ ${e.message}`, ANSI.red)));
+  });
+
+  // Ctrl+C：3 秒内连按两次才退出，避免手滑把代理停掉
+  let lastSigint = 0;
+  rl.on('SIGINT', () => {
+    const now = Date.now();
+    if (now - lastSigint < 3000) { tuiShutdown('Ctrl+C'); return; }
+    lastSigint = now;
+    tuiWriteAbovePrompt(paint('再按一次 Ctrl+C 退出；输入 0 也可退出（代理会继续在后台运行）', ANSI.yellow));
+  });
+
+  // stdin 关闭（Ctrl+Z / 管道结束）→ 队列跑完后收摊
+  rl.on('close', () => {
+    if (TUI.closing) return;
+    TUI.queue = TUI.queue.then(() => tuiShutdown('stdin 已关闭'));
+  });
+
+  process.stdout.write(`${tuiHeader()}\n${tuiMenu()}\n`);
+  if (!TUI.apiKey) {
+    process.stdout.write(paint('提示：尚未设置 API Key，按 [4] 设置后才能看到当前套餐的模型列表。\n', ANSI.yellow));
+  } else {
+    process.stdout.write(paint('正在读取当前套餐可用模型…\n', ANSI.dim));
+  }
+  rl.setPrompt(TUI_MAIN_PROMPT);
+  rl.prompt();
+
+  // 启动即自动展示一次当前套餐可用模型（命中 5 分钟缓存时不再打接口）
+  if (TUI.apiKey) TUI.queue = TUI.queue.then(() => tuiShowModels(false));
+}
+
 // ── 服务器 ──────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
@@ -2131,6 +2613,7 @@ const server = http.createServer(async (req, res) => {
   const host = req.headers.host || 'localhost';
   const url = new URL(req.url, `http://${host}`);
 
+  stats.requests++;
   try {
     if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
       await handleChatCompletions(req, res);
@@ -2144,6 +2627,7 @@ const server = http.createServer(async (req, res) => {
       sendJSON(res, 404, { error: { message: 'Not found', type: 'not_found' } });
     }
   } catch (e) {
+    stats.errors++;
     sendJSON(res, 500, { error: { message: e.message, type: 'internal_error' } });
   }
 });
@@ -2159,14 +2643,20 @@ process.on('unhandledRejection', (reason) => {
 });
 
 server.listen(CFG.port, CFG.host, () => {
+  const tuiOn = resolveTuiMode();
   log('info', 'CC Proxy started', {
     url: `http://${CFG.host}:${CFG.port}`,
     api: CFG.apiBase,
     models: MODELS.length,
     session: '12h + 1h jitter, per API key',
     logFile: CFG.logFile || '(console only)',
+    tui: tuiOn ? 'on' : 'off',
   });
-  if (!CFG.apiKey) {
+  if (!CFG.apiKey && !process.env.CC_API_KEY) {
     log('info', 'No API key in config. API key must be sent in Authorization: Bearer <key> header per request.');
   }
+
+  // 交互式控制台：仅 TTY 下启用；Docker / CI / 重定向时保持纯日志输出（与旧版一致）
+  if (tuiOn) startTui();
+  else if (process.stdout.isTTY) log('info', 'Interactive console disabled (--no-tui / CC_TUI=0)');
 });

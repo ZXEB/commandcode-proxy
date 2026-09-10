@@ -64,14 +64,15 @@ commandcode/
 ────────────────────────────────────────────────────────────
  Command Code → OpenAI / Anthropic 代理 · 控制台
  服务 http://0.0.0.0:3050 │ 运行 3m12s │ 已处理请求 128
- API Key user_****a1b2 （来源: config.json）
+ API Key user_****a1b2 （来源: config.local.json）
 ────────────────────────────────────────────────────────────
  [1] 查看当前套餐可用模型
  [2] 强制刷新模型列表（跳过 5 分钟缓存）
- [3] 服务状态与配置
- [4] 设置 / 更换 API Key
- [5] 查看最近日志
- [6] 清屏
+ [3] 查看当前套餐额度
+ [4] 服务状态与配置
+ [5] 设置 / 更换 API Key
+ [6] 查看最近日志
+ [7] 清屏
  [0] 退出（停止代理）
 请输入序号 >
 ```
@@ -80,16 +81,39 @@ commandcode/
 |-----|--------|
 | `1` | List the models **your plan** can use (`GET {apiBase}/provider/v1/models`, scoped to your key) with index, model ID and note |
 | `2` | Force a re-fetch, bypassing the 5-minute cache |
-| `3` | Listen address, uptime, upstream API, model source & cache, request counters |
-| `4` | Set / change the API key (no echo; optionally saved to the project's `config.local.json`) |
-| `5` | Last 40 log lines (in-memory ring buffer, max 300, never written to disk) |
-| `6` | Clear screen |
+| `3` | Show **your plan quota**: plan name / subscription status / credits remaining / credit pool / spent this period with a progress bar / billing period and days left. Quota changes slowly, so a second press within a minute serves the cache — press again to force a refresh |
+| `4` | Listen address, uptime, upstream API, model source & cache, request counters |
+| `5` | Set / change the API key (no echo; optionally saved to the project's `config.local.json`) |
+| `6` | Last 40 log lines (in-memory ring buffer, max 300, never written to disk) |
+| `7` | Clear screen |
 | `0` | Exit and stop the proxy (`q` / `exit` also work); press Ctrl+C twice |
+
+**What `[3]` looks like:**
+
+```
+当前套餐额度
+ 套餐：Go（active）   标称额度 $10.00/月
+ 账号：your-name
+ 剩余：$5.04 / 额度池 $10.00
+ 已用：$4.95  [██████████░░░░░░░░░░] 49.6%
+       其中 月度 $5.04 · 加油包 $0.00 · 赠送 $0.00
+ 周期：2026/8/25 14:03:54 → 2026/9/25 14:03:54 · 还剩 15 天
+
+ 数据来源: CC 账单接口 · 刚刚拉取
+```
+
+Quota comes from Command Code's own billing endpoints — the same ones the official CLI's `/usage` panel uses (`/alpha/whoami`, `/alpha/billing/credits`, `/alpha/billing/subscriptions`, `/alpha/usage/summary`). They are read-only GETs and consume no credits. The math matches the CLI's `projectUsageView`:
+
+- **remaining** = monthly + purchased + free credits;
+- **credit pool** = when the subscription is active, `max(plan's nominal credits, monthly remaining)` + purchased + free; otherwise spent + remaining;
+- **spent** = `totalCost` since the start of the current billing period.
+
+When the data cannot be fetched it reports the error honestly (e.g. 401 for an invalid key) and **never invents numbers**; if a refresh fails while older data is cached, the panel labels it explicitly as stale. Any `windowLimits` rate-limit windows returned by the server are listed too.
 
 Notes:
 
 - **The menu is reprinted after every command's output**, so you never have to scroll back up to pick the next option.
-- **Model list provenance is labeled honestly**: on success it shows `数据来源: Provider API`; on failure (invalid key 401, network error, `useProviderModels` disabled) it states the reason and makes clear the listed entries are the **built-in reference list**, which may contain models your plan cannot use.
+- **Model list provenance is labeled honestly**: on success it shows `数据来源: Provider API`; on failure (invalid key 401, network error, `useProviderModels` disabled) it states the reason and makes clear the listed entries are the **built-in reference list**, which may contain models your plan cannot use. That built-in list is an offline fallback and can lag behind production (which carries dozens of models) — with a valid key, trust the live result from `[1]`.
 - **API key resolution order**: `CC_API_KEY` / `COMMANDCODE_API_KEY` env → project `config.local.json` → `config.json` → menu `[4]`. Request-side auth (`Authorization` / `x-api-key`) is unchanged and independent of the console. If a terminal paste repeats the same key several times, the copies are collapsed into one (with an explicit notice) instead of saving one giant invalid key.
 - **Nothing is written to your C: drive**: the console itself creates no files (readline history is memory-only). Only when you answer `y` in menu `[4]` is the key written to `config.local.json` **inside the project directory** (excluded via `.gitignore` / `.dockerignore`, so it is never committed or baked into an image) — never `%APPDATA%`, `%TEMP%`, your home directory or the registry.
 - **Logs never shred the prompt**: runtime logs and upstream errors clear the current input line, print, then redraw `请输入序号 >`.

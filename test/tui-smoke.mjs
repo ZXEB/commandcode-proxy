@@ -23,29 +23,75 @@ const PLAN_MODELS = [
   { id: 'xiaomi/mimo-v2.5', name: 'MiMo V2.5' },
 ];
 const BAD_KEY = 'user_badkey999';
+const NO_QUOTA_KEY = 'user_noquota111'; // 模型能拉、额度接口 401
 const MENU_MARK = '[0] 退出（停止代理）';
 
 // ── Mock 上游 ─────────────────────────────────────────
-const mockRequests = { provider: 0, badKey: 0 };
+const mockRequests = { provider: 0, badKey: 0, quota: 0, quotaPaths: [] };
 const mock = http.createServer((req, res) => {
   let body = '';
   req.on('data', (c) => { body += c; });
   req.on('end', () => {
     const auth = req.headers.authorization || '';
+    const send = (status, obj) => {
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(obj));
+    };
+
     if (req.url === '/provider/v1/models') {
       mockRequests.provider++;
       if (auth.includes(BAD_KEY)) {
         mockRequests.badKey++;
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'invalid api key' } }));
+        send(401, { error: { message: 'invalid api key' } });
         return;
       }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ object: 'list', data: PLAN_MODELS }));
+      send(200, { object: 'list', data: PLAN_MODELS });
       return;
     }
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end('{}'); // fingerprint / lifecycle-events / 其他
+
+    // 套餐额度：与官方 CLI 一致的 4 个端点
+    if (req.url.startsWith('/alpha/')) {
+      mockRequests.quota++;
+      mockRequests.quotaPaths.push(req.url);
+      if (auth.includes(BAD_KEY) || auth.includes(NO_QUOTA_KEY)) {
+        send(401, { error: { message: 'invalid api key' } });
+        return;
+      }
+      const path = req.url.split('?')[0];
+      if (path === '/alpha/whoami') {
+        send(200, { user: { id: 'u_1', userName: 'tester' }, org: { id: 'org_9', login: 'tester-org' } });
+        return;
+      }
+      if (path === '/alpha/billing/credits') {
+        send(200, {
+          credits: {
+            planId: 'individual-pro-v1',
+            monthlyCredits: 63.5,
+            purchasedCredits: 10,
+            freeCredits: 1.5,
+            windowLimits: { fiveHour: { used: 3, limit: 20, resetAt: '2026-09-10T18:00:00Z' } },
+          },
+        });
+        return;
+      }
+      if (path === '/alpha/billing/subscriptions') {
+        send(200, {
+          data: {
+            planId: 'individual-pro-v1',
+            status: 'active',
+            currentPeriodStart: '2026-09-01T00:00:00Z',
+            currentPeriodEnd: '2026-10-01T00:00:00Z',
+          },
+        });
+        return;
+      }
+      if (path === '/alpha/usage/summary') {
+        send(200, { totalCost: 25.5 });
+        return;
+      }
+    }
+
+    send(200, {}); // fingerprint / lifecycle-events / 其他
   });
 });
 
@@ -123,8 +169,8 @@ async function main() {
   const a = await runProxy({
     apiKey: 'user_tuitest123',
     steps: [
-      { waitFor: '当前套餐可用模型（共 3 个）', send: '3\n' },
-      { waitFor: '服务状态与配置', send: '5\n' },
+      { waitFor: '当前套餐可用模型（共 3 个）', send: '4\n' },
+      { waitFor: '服务状态与配置', send: '6\n' },
       { waitFor: '最近日志', send: '0\n' },
     ],
   });
@@ -132,8 +178,8 @@ async function main() {
   check(a.out.includes('当前套餐可用模型（共 3 个）'), '展示套餐模型数量');
   for (const m of PLAN_MODELS) check(a.out.includes(m.id), `模型 ${m.id} 在列表中`);
   check(a.out.includes('数据来源: Provider API'), '标注数据来源为 Provider API');
-  check(a.out.includes('服务状态与配置') && a.out.includes('已处理请求'), '菜单 [3] 服务状态');
-  check(a.out.includes('最近日志'), '菜单 [5] 最近日志');
+  check(a.out.includes('服务状态与配置') && a.out.includes('已处理请求'), '菜单 [4] 服务状态');
+  check(a.out.includes('最近日志'), '菜单 [6] 最近日志');
   check(a.out.includes('请输入序号 >'), '主菜单提示符');
   // 输出会滚动追加，菜单必须每次输出完再摆一遍，否则用户得往上翻
   const menuCount = a.out.split(MENU_MARK).length - 1;
@@ -149,7 +195,7 @@ async function main() {
     apiKey: BAD_KEY,
     steps: [
       { waitFor: '以下为内置参考列表', send: '2\n' },
-      { waitFor: '请按 [4] 设置有效 API Key 后重试。', send: '0\n' },
+      { waitFor: '请按 [5] 设置有效 API Key 后重试。', send: '0\n' },
     ],
   });
   check(b.code === 0, '退出码 0', `实际 ${b.code}\n${tail(b.out)}`);
@@ -161,13 +207,57 @@ async function main() {
   check(!b.out.includes(BAD_KEY), '❌ 未泄露无效 Key');
   check(mockRequests.badKey >= 1, 'mock 已收到无效 Key 请求');
 
-  // C. 菜单 [4] 手动输入 Key —— 不回显、不落盘
-  console.log('\n场景 C：菜单 [4] 手输 Key · 回显屏蔽 + 选择不写盘');
+  // B2. 套餐额度：[3] 展示套餐名 / 剩余 / 已用 / 周期 / 限流窗口
+  console.log('\n场景 B2：菜单 [3] 查看当前套餐额度');
+  const b2 = await runProxy({
+    apiKey: 'user_tuitest123',
+    steps: [
+      { waitFor: '当前套餐可用模型（共 3 个）', send: '3\n' },
+      { waitFor: '数据来源: CC 账单接口', send: '0\n' },
+    ],
+  });
+  check(b2.code === 0, '退出码 0', `实际 ${b2.code}\n${tail(b2.out)}`);
+  check(b2.out.includes('当前套餐额度'), '显示额度面板标题');
+  check(b2.out.includes('套餐：Pro') && b2.out.includes('（active）'), '解析出套餐名 Pro 与 active 状态');
+  check(b2.out.includes('标称额度 $80.00/月'), 'planId individual-pro-v1 → 标称额度 $80/月（长前缀优先）');
+  // 剩余 = 63.5 + 10 + 1.5 = 75.00；额度池 = max(80, 63.5) + 10 + 1.5 = 91.50；已用 = 25.50
+  check(b2.out.includes('剩余：$75.00 / 额度池 $91.50'), '剩余与额度池计算正确（对齐 CLI projectUsageView）');
+  check(b2.out.includes('已用：$25.50'), '本期已花费正确（usage/summary 的 totalCost）');
+  check(b2.out.includes('其中 月度 $63.50 · 加油包 $10.00 · 赠送 $1.50'), '三类额度拆分正确');
+  check(/\[\u2588+\u2591+\] \d+\.\d%/.test(b2.out), '渲染出进度条与百分比');
+  check(b2.out.includes('账号：tester') && b2.out.includes('组织 tester-org'), '展示账号与组织');
+  check(b2.out.includes('还剩'), '展示周期剩余天数');
+  check(b2.out.includes('限流窗口') && b2.out.includes('fiveHour') && b2.out.includes('用量 3 / 20'), '防御式展示 windowLimits');
+  check(b2.out.includes('数据来源: CC 账单接口'), '标注数据来源');
+  const quotaPaths = mockRequests.quotaPaths.map((u) => u.split('?')[0]);
+  check(quotaPaths.includes('/alpha/whoami'), '先请求 whoami');
+  check(quotaPaths.includes('/alpha/billing/credits'), '请求 billing/credits');
+  check(quotaPaths.includes('/alpha/billing/subscriptions'), '请求 billing/subscriptions');
+  check(quotaPaths.includes('/alpha/usage/summary'), '请求 usage/summary');
+  check(mockRequests.quotaPaths.some((u) => u.includes('orgId=org_9')), '带上了 whoami 返回的 orgId');
+  check(mockRequests.quotaPaths.some((u) => u.includes('since=2026-09-01')), 'usage/summary 带上了周期起点 since');
+  check(!b2.out.includes('user_tuitest123'), '❌ 额度面板未泄露完整 API Key');
+
+  // C. 额度接口 401：如实报错，不编数字
+  console.log('\n场景 C：额度接口 401 · 如实报错且不伪造额度');
+  const c0 = await runProxy({
+    apiKey: NO_QUOTA_KEY,
+    steps: [
+      { waitFor: '当前套餐可用模型（共 3 个）', send: '3\n' },
+      { waitFor: '❌ 读取失败', send: '0\n' },
+    ],
+  });
+  check(c0.code === 0, '退出码 0', `实际 ${c0.code}\n${tail(c0.out)}`);
+  check(c0.out.includes('❌ 读取失败') && c0.out.includes('401'), '提示读取失败并给出 401');
+  check(!c0.out.includes('剩余：$'), '❌ 失败时没有编造额度数字');
+
+  // D. 菜单 [5] 手动输入 Key —— 不回显、不落盘
+  console.log('\n场景 D：菜单 [5] 手输 Key · 回显屏蔽 + 选择不写盘');
   const typedKey = 'user_typedkey777';
   const c = await runProxy({
     apiKey: '',
     steps: [
-      { waitFor: '请输入序号', send: '4\n' },
+      { waitFor: '请输入序号', send: '5\n' },
       { waitFor: '粘贴 API Key', send: `${typedKey}\n` },
       { waitFor: '是否写入 config.local.json', send: 'n\n' },
       { waitFor: '未写入文件，仅本次运行有效', send: '1\n' },
@@ -185,13 +275,13 @@ async function main() {
   const localNow = fs.existsSync(LOCAL_CONFIG_PATH) ? fs.readFileSync(LOCAL_CONFIG_PATH, 'utf8') : null;
   check(localNow === localBefore, '选择 n 时不新建/不改动 config.local.json');
 
-  // D. 菜单 [4] 输入 Key 并选择写入 → 落到 config.local.json（git/镜像已排除），结束还原
-  console.log('\n场景 D：菜单 [4] 手输 Key · 重复粘贴自动合并 + 选择 y 持久化');
+  // E. 菜单 [5] 输入 Key 并选择写入 → 落到 config.local.json（git/镜像已排除），结束还原
+  console.log('\n场景 E：菜单 [5] 手输 Key · 重复粘贴自动合并 + 选择 y 持久化');
   const typedKey2 = 'user_typedkey888';
   const d = await runProxy({
     apiKey: '',
     steps: [
-      { waitFor: '请输入序号', send: '4\n' },
+      { waitFor: '请输入序号', send: '5\n' },
       // 模拟终端里连续粘贴 3 次同一把 Key（真实踩过的坑：贪婪正则会把它们粘成一把超长 Key）
       { waitFor: '粘贴 API Key', send: `${typedKey2}${typedKey2}${typedKey2}\n` },
       { waitFor: '是否写入 config.local.json', send: 'y\n' },

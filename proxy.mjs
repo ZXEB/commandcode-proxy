@@ -2191,6 +2191,178 @@ function handleHealth(req, res) {
   res.end('OK');
 }
 
+// ── 当前套餐额度 ────────────────────────────────────
+// 端点与数据结构对齐官方 CLI（command-code dist/cli.mjs）：
+//   GET /alpha/whoami                          → { user, org }
+//   GET /alpha/billing/credits?orgId=          → { credits: { planId, monthlyCredits, purchasedCredits, freeCredits, windowLimits? } }
+//   GET /alpha/billing/subscriptions?orgId=    → { data: { planId, status, currentPeriodStart, currentPeriodEnd } }
+//   GET /alpha/usage/summary?orgId=&since=     → { totalCost, ... }
+// 先用 whoami 拿 orgId，credits 与 subscriptions 并行，最后按本周期起点 currentPeriodStart
+// 查已花费（totalCost）。credits 的单位是美元。
+
+const PLAN_MONTHLY_CREDITS = {
+  'individual-go': 10,
+  'individual-goat': 70,
+  'individual-pro': 30,
+  'individual-pro-v1': 80,
+  'individual-provider': 15,
+  'individual-max': 150,
+  'individual-ultra': 300,
+  'teams-pro': 40,
+};
+const PLAN_DISPLAY_NAMES = {
+  'individual-go': 'Go',
+  'individual-goat': 'GOAT',
+  'individual-pro': 'Pro',
+  'individual-pro-v1': 'Pro',
+  'individual-provider': 'Provider',
+  'individual-max': 'Max',
+  'individual-ultra': 'Ultra',
+  'teams-pro': 'Teams Pro',
+};
+// 长前缀优先匹配（与 CLI 一致），避免 individual-pro 抢走 individual-pro-v1
+const PLAN_KEYS_BY_LENGTH = Object.keys(PLAN_MONTHLY_CREDITS).sort((a, b) => b.length - a.length);
+// 订阅处于这些状态时，额度才按"有效套餐"计算（与 CLI 的 Vr 集合一致）
+const PLAN_ACTIVE_STATUSES = new Set(['active', 'trialing', 'past_due']);
+
+function getPlanInfo(planId) {
+  if (!planId) return null;
+  const normalized = String(planId).toLowerCase().replace(/_/g, '-');
+  const key = PLAN_KEYS_BY_LENGTH.find((k) => normalized.startsWith(k));
+  if (!key) return null;
+  return { name: PLAN_DISPLAY_NAMES[key] ?? key, monthlyCredits: PLAN_MONTHLY_CREDITS[key] };
+}
+
+let quotaCache = null;            // { at, view, raw }
+const QUOTA_CACHE_MS = 60 * 1000; // 额度变化慢，1 分钟内重复查看直接复用
+
+function quotaHeaders(apiKey) {
+  return {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${apiKey}`,
+    'x-cli-environment': 'production',
+    'x-command-code-version': CC_VERSION,
+    'traceparent': generateTraceparent(),
+  };
+}
+
+async function quotaGet(apiKey, endpoint) {
+  const response = await fetch(`${CFG.apiBase}${endpoint}`, {
+    headers: quotaHeaders(apiKey),
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!response.ok) {
+    const err = new Error(response.status === 401
+      ? 'API Key 无效或已过期（HTTP 401）'
+      : `额度接口返回 HTTP ${response.status}`);
+    err.status = response.status;
+    throw err;
+  }
+  return response.json();
+}
+
+// 把几个接口的原始数据摊平成视图（算法与官方 CLI 的 projectUsageView 一致）
+function projectQuota({ whoami, credits, subscription, summary }) {
+  const sub = subscription?.data ?? null;
+  const c = credits?.credits ?? null;
+  const plan = getPlanInfo(sub?.planId ?? c?.planId ?? '');
+
+  const monthlyRemaining = Math.max(0, c?.monthlyCredits ?? 0);
+  const purchasedRemaining = Math.max(0, c?.purchasedCredits ?? 0);
+  const freeRemaining = Math.max(0, c?.freeCredits ?? 0);
+  const totalRemaining = monthlyRemaining + purchasedRemaining + freeRemaining;
+
+  const totalSpent = Math.max(0, summary?.totalCost ?? 0);
+  // 订阅有效时用套餐标称额度当分母（额度可能被补发/叠加，取较大者）
+  const monthlyPool = sub && PLAN_ACTIVE_STATUSES.has(sub.status) ? (plan?.monthlyCredits ?? null) : null;
+  const totalPool = monthlyPool !== null
+    ? Math.max(monthlyPool, monthlyRemaining) + purchasedRemaining + freeRemaining
+    : totalSpent + totalRemaining;
+
+  const hasCreditsInfo = totalRemaining > 0 || totalSpent > 0;
+  const usagePercent = hasCreditsInfo && totalPool > 0
+    ? Math.min(((totalPool - totalRemaining) / totalPool) * 100, 100)
+    : 0;
+
+  let daysLeft = null;
+  if (sub?.currentPeriodEnd) {
+    const end = new Date(sub.currentPeriodEnd);
+    if (!Number.isNaN(end.getTime())) daysLeft = Math.max(0, Math.ceil((end.getTime() - Date.now()) / 86400000));
+  }
+
+  return {
+    user: whoami?.user ?? null,
+    org: whoami?.org ?? null,
+    subscription: sub,
+    plan,
+    credits: {
+      monthlyRemaining, purchasedRemaining, freeRemaining, totalRemaining,
+      totalSpent, totalPool, usagePercent, hasCreditsInfo,
+    },
+    windowLimits: c?.windowLimits ?? null,
+    summary: summary ?? null,
+    daysLeft,
+  };
+}
+
+// force=true 跳过 1 分钟缓存。失败时如实返回错误；手里有旧数据则一并带出（界面会标注是旧数据）。
+async function fetchQuota(apiKey, opts = {}) {
+  return track(doFetchQuota(apiKey, opts));
+}
+
+async function doFetchQuota(apiKey, { force = false } = {}) {
+  const now = Date.now();
+  if (!force && quotaCache && (now - quotaCache.at) < QUOTA_CACHE_MS) {
+    return { ok: true, view: quotaCache.view, raw: quotaCache.raw, at: quotaCache.at, cached: true };
+  }
+
+  try {
+    if (!apiKey) throw new Error('未提供 API Key');
+
+    const whoami = await quotaGet(apiKey, '/alpha/whoami');
+    const orgId = whoami?.org?.id ?? null;
+    const orgQs = orgId ? `?orgId=${encodeURIComponent(orgId)}` : '';
+
+    const [credits, subscription] = await Promise.all([
+      quotaGet(apiKey, `/alpha/billing/credits${orgQs}`),
+      quotaGet(apiKey, `/alpha/billing/subscriptions${orgQs}`),
+    ]);
+
+    // 本周期起点 → 本期已花费；没有周期起点就不带 since（让服务端用默认窗口）
+    const since = subscription?.data?.currentPeriodStart ?? null;
+    const summaryParams = new URLSearchParams();
+    if (orgId) summaryParams.set('orgId', orgId);
+    if (since) summaryParams.set('since', since);
+    const summaryQs = summaryParams.toString();
+    let summary = null;
+    try {
+      summary = await quotaGet(apiKey, `/alpha/usage/summary${summaryQs ? `?${summaryQs}` : ''}`);
+    } catch (e) {
+      // 已花费拿不到不该让整个额度面板失败，其余字段照常展示
+      log('warn', 'Usage summary fetch failed', { error: e.message });
+    }
+
+    const raw = { whoami, credits, subscription, summary };
+    const view = projectQuota(raw);
+    quotaCache = { at: now, view, raw };
+    log('info', 'Fetched plan quota', {
+      plan: view.plan?.name ?? subscription?.data?.planId ?? 'unknown',
+      remaining: view.credits.totalRemaining,
+      spent: view.credits.totalSpent,
+    });
+    return { ok: true, view, raw, at: now, cached: false };
+  } catch (e) {
+    log('warn', 'Quota fetch failed', { error: e.message });
+    return {
+      ok: false,
+      error: e.message,
+      view: quotaCache?.view ?? null,
+      raw: quotaCache?.raw ?? null,
+      at: quotaCache?.at ?? null,
+    };
+  }
+}
+
 // ══ 交互式控制台（cmd TUI） ═══════════════════════════
 // 设计约束：
 //  1. 纯 Node 内置模块（readline），零外部依赖，保持单文件分发；
@@ -2346,13 +2518,16 @@ function tuiMenu() {
   return [
     ` ${n(1)} 查看当前套餐可用模型`,
     ` ${n(2)} 强制刷新模型列表（跳过 5 分钟缓存）`,
-    ` ${n(3)} 服务状态与配置`,
-    ` ${n(4)} 设置 / 更换 API Key`,
-    ` ${n(5)} 查看最近日志`,
-    ` ${n(6)} 清屏`,
+    ` ${n(3)} 查看当前套餐额度`,
+    ` ${n(4)} 服务状态与配置`,
+    ` ${n(5)} 设置 / 更换 API Key`,
+    ` ${n(6)} 查看最近日志`,
+    ` ${n(7)} 清屏`,
     ` ${n(0)} 退出（停止代理）`,
   ].join('\n');
 }
+
+const TUI_MENU_HINT = '请输入 0-7';
 
 function tuiAsk(promptText) {
   return new Promise((resolve) => {
@@ -2366,7 +2541,7 @@ function tuiAsk(promptText) {
 // [1] / [2] 当前套餐可用模型
 async function tuiShowModels(force = false) {
   if (!TUI.apiKey) {
-    tuiWriteAbovePrompt(paint('⚠️  还没有 API Key —— 请先按 [4] 设置（Key 必须以 user_ 开头）', ANSI.yellow));
+    tuiWriteAbovePrompt(paint('⚠️  还没有 API Key —— 请先按 [5] 设置（Key 必须以 user_ 开头）', ANSI.yellow));
     return;
   }
   tuiWriteAbovePrompt(paint(force ? '正在重新拉取当前套餐可用模型…' : '正在读取当前套餐可用模型…', ANSI.dim));
@@ -2383,7 +2558,7 @@ async function tuiShowModels(force = false) {
     ));
   } else {
     out.push(paint(` ⚠️  未能获取套餐模型（${modelsLastError || '未知原因'}）`, ANSI.yellow));
-    out.push(paint('     以下为内置参考列表，可能包含当前套餐不可用的模型；请按 [4] 设置有效 API Key 后重试。', ANSI.yellow));
+    out.push(paint('     以下为内置参考列表，可能包含当前套餐不可用的模型；请按 [5] 设置有效 API Key 后重试。', ANSI.yellow));
   }
   out.push('');
   out.push(paint(`  ${padEndW('#', 5)}${padEndW('模型 ID', width + 2)}备注`, ANSI.dim));
@@ -2398,7 +2573,113 @@ async function tuiShowModels(force = false) {
   tuiWriteAbovePrompt(out.join('\n'));
 }
 
-// [3] 服务状态与配置
+// [3] 当前套餐额度
+function formatCredits(n) {
+  return `$${Number(n || 0).toFixed(2)}`;
+}
+
+function progressBar(percent, width = 20) {
+  const clamped = Math.max(0, Math.min(100, percent));
+  const filled = Math.round((width * clamped) / 100);
+  return `[${'█'.repeat(filled)}${'░'.repeat(width - filled)}]`;
+}
+
+function formatDateTime(v) {
+  if (!v) return '-';
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? String(v) : d.toLocaleString();
+}
+
+// windowLimits 的结构在 CLI 里没有渲染逻辑可参考，这里做防御式展示：
+// 认得常见字段就按窗口列出来，认不得就原样 JSON —— 绝不猜着编。
+function formatWindowLimits(limits) {
+  if (!limits) return [];
+  const entries = Array.isArray(limits)
+    ? limits.map((v, i) => [v?.window ?? v?.label ?? v?.name ?? `窗口 ${i + 1}`, v])
+    : Object.entries(limits);
+  if (!entries.length) return [];
+
+  const out = [paint('  限流窗口', ANSI.bold)];
+  for (const [label, v] of entries) {
+    if (v === null || typeof v !== 'object') { out.push(`    ${label}: ${v}`); continue; }
+    const used = v.used ?? v.consumed ?? v.current;
+    const limit = v.limit ?? v.total ?? v.max;
+    const remaining = v.remaining ?? (typeof used === 'number' && typeof limit === 'number' ? limit - used : undefined);
+    const resetAt = v.resetAt ?? v.resetsAt ?? v.resetTime ?? v.windowEnd;
+    const bits = [];
+    if (limit !== undefined) bits.push(`用量 ${used ?? '?'} / ${limit}`);
+    if (remaining !== undefined) bits.push(`剩余 ${remaining}`);
+    if (resetAt) bits.push(`重置 ${formatDateTime(resetAt)}`);
+    out.push(`    ${label}: ${bits.length ? bits.join(' · ') : JSON.stringify(v)}`);
+  }
+  return out;
+}
+
+async function tuiShowQuota(force = false) {
+  if (!TUI.apiKey) {
+    tuiWriteAbovePrompt(paint('⚠️  还没有 API Key —— 请先按 [5] 设置（Key 必须以 user_ 开头）', ANSI.yellow));
+    return;
+  }
+  tuiWriteAbovePrompt(paint(force ? '正在重新读取当前套餐额度…' : '正在读取当前套餐额度…', ANSI.dim));
+
+  const r = await fetchQuota(TUI.apiKey, { force });
+  const out = ['', paint('当前套餐额度', ANSI.bold, ANSI.cyan)];
+
+  if (!r.ok && !r.view) {
+    out.push(paint(` ❌ 读取失败：${r.error}`, ANSI.red));
+    out.push(paint('    额度由 CC 服务端提供，需要有效 API Key；若提示 401 请到 CC 重新复制一把。', ANSI.dim));
+    out.push('');
+    tuiWriteAbovePrompt(out.join('\n'));
+    return;
+  }
+
+  const v = r.view;
+  const c = v.credits;
+  const planName = v.plan?.name ?? (v.subscription?.planId ? String(v.subscription.planId) : '未知套餐');
+
+  const statusTag = v.subscription?.status
+    ? paint(`（${v.subscription.status}）`, PLAN_ACTIVE_STATUSES.has(v.subscription.status) ? ANSI.green : ANSI.yellow)
+    : '';
+  out.push(` 套餐：${paint(planName, ANSI.bold)}${statusTag}${v.plan ? paint(`   标称额度 ${formatCredits(v.plan.monthlyCredits)}/月`, ANSI.dim) : ''}`);
+
+  if (v.user?.userName || v.user?.name) {
+    out.push(` 账号：${v.user.userName || v.user.name}${v.org?.login ? `  ·  组织 ${v.org.login}` : ''}`);
+  }
+
+  if (c.hasCreditsInfo) {
+    out.push(` 剩余：${paint(formatCredits(c.totalRemaining), ANSI.bold, ANSI.green)} / 额度池 ${formatCredits(c.totalPool)}`);
+    out.push(` 已用：${formatCredits(c.totalSpent)}  ${progressBar(c.usagePercent)} ${c.usagePercent.toFixed(1)}%`);
+    out.push(paint(
+      `       其中 月度 ${formatCredits(c.monthlyRemaining)} · 加油包 ${formatCredits(c.purchasedRemaining)} · 赠送 ${formatCredits(c.freeRemaining)}`,
+      ANSI.dim,
+    ));
+  } else {
+    out.push(paint(' ⚠️  服务端没有返回额度数字（可能是新套餐，或该套餐不按额度计费）', ANSI.yellow));
+  }
+
+  if (v.subscription?.currentPeriodEnd) {
+    const days = v.daysLeft;
+    const daysTag = days === null ? '' : (days < 3 ? paint(` · 仅剩 ${days} 天`, ANSI.red) : ` · 还剩 ${days} 天`);
+    out.push(` 周期：${formatDateTime(v.subscription.currentPeriodStart)} → ${formatDateTime(v.subscription.currentPeriodEnd)}${daysTag}`);
+  }
+
+  const windows = formatWindowLimits(v.windowLimits);
+  if (windows.length) out.push('', ...windows);
+
+  const age = r.at ? Math.round((Date.now() - r.at) / 1000) : null;
+  out.push('');
+  if (r.ok) {
+    out.push(paint(r.cached
+      ? ` 数据来源: CC 账单接口 · ${age}s 前的缓存（再按一次 [3] 强制刷新）`
+      : ' 数据来源: CC 账单接口 · 刚刚拉取', ANSI.dim));
+  } else {
+    out.push(paint(` ⚠️  本次刷新失败（${r.error}），以上为 ${age}s 前的旧数据`, ANSI.yellow));
+  }
+  out.push('');
+  tuiWriteAbovePrompt(out.join('\n'));
+}
+
+// [4] 服务状态与配置
 function tuiShowStatus() {
   const cacheLeft = dynamicModels
     ? `${dynamicModels.length} 个 · ${Math.max(0, Math.round((CFG.modelRefreshIntervalMs - (Date.now() - modelsLastFetch)) / 1000))}s 后过期`
@@ -2426,7 +2707,7 @@ function tuiShowStatus() {
   ].join('\n'));
 }
 
-// [4] 设置 / 更换 API Key
+// [5] 设置 / 更换 API Key
 async function tuiSetApiKey() {
   TUI.maskInput = true; // 输入期间不回显
   let typed = '';
@@ -2467,7 +2748,7 @@ async function tuiSetApiKey() {
   }
 }
 
-// [5] 最近日志
+// [6] 最近日志
 function tuiShowLogs() {
   const lines = logRing.slice(-40);
   tuiWriteAbovePrompt([
@@ -2478,7 +2759,7 @@ function tuiShowLogs() {
   ].join('\n'));
 }
 
-// [6] 清屏
+// [7] 清屏
 function tuiClearScreen() {
   process.stdout.write('\x1b[2J\x1b[3J\x1b[H');
   tuiWriteAbovePrompt(`${tuiHeader()}\n${tuiMenu()}`); // 已自带提示符重绘
@@ -2543,10 +2824,11 @@ async function tuiHandleLine(raw) {
   switch (line) {
     case '1': await tuiShowModels(false); break;
     case '2': await tuiShowModels(true); break;
-    case '3': tuiShowStatus(); break;
-    case '4': await tuiSetApiKey(); break;
-    case '5': tuiShowLogs(); break;
-    case '6': tuiClearScreen(); return; // 已重绘菜单 + 提示符，不再重复
+    case '3': await tuiShowQuota(true); break;
+    case '4': tuiShowStatus(); break;
+    case '5': await tuiSetApiKey(); break;
+    case '6': tuiShowLogs(); break;
+    case '7': tuiClearScreen(); return; // 已重绘菜单 + 提示符，不再重复
     case '0':
     case 'q':
     case 'Q':
@@ -2554,7 +2836,7 @@ async function tuiHandleLine(raw) {
       await tuiShutdown('用户退出');
       return;
     default:
-      tuiWriteAbovePrompt(paint(`未知序号「${line}」—— 请输入 0-6`, ANSI.yellow));
+      tuiWriteAbovePrompt(paint(`未知序号「${line}」—— ${TUI_MENU_HINT}`, ANSI.yellow));
   }
 
   tuiReprompt(); // 输出完再摆一次菜单
@@ -2617,7 +2899,7 @@ function startTui() {
 
   process.stdout.write(`${tuiHeader()}\n${tuiMenu()}\n`);
   if (!TUI.apiKey) {
-    process.stdout.write(paint('提示：尚未设置 API Key，按 [4] 设置后才能看到当前套餐的模型列表。\n', ANSI.yellow));
+    process.stdout.write(paint('提示：尚未设置 API Key，按 [5] 设置后才能看到当前套餐的模型列表与额度。\n', ANSI.yellow));
   }
   rl.setPrompt(TUI_MAIN_PROMPT);
   rl.prompt();

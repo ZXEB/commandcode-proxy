@@ -6,15 +6,22 @@ A reverse proxy that converts Command Code API to OpenAI / Anthropic compatible 
 
 Built by analyzing official CLI network traffic to accurately replicate the Command Code API request protocol, including device-fingerprint and lifecycle pre-requests.
 
-**Features**: OpenAI Chat Completions + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
+**Features**: Built-in interactive console (cmd TUI — list the models your plan can use) | OpenAI Chat Completions + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
 
 **Community**: [Linux.do](https://linux.do) — a friendly Chinese tech community.
 
 ## Quick Start
 
 ```bash
-npm start        # Start (the repo ships with config.json listening on http://0.0.0.0:3050)
+npm start        # Start (repo config.json listens on http://0.0.0.0:3050) and enter the interactive console
 npm run dev      # Watch mode (auto-reload on file changes)
+node proxy.mjs   # Same start, without npm writing logs to your C: drive
+```
+
+Once started, cmd shows a numbered menu: type `1` to list the models **your API key's plan** can use. For plain log output only, add `--no-tui`:
+
+```bash
+node proxy.mjs --no-tui
 ```
 
 API Key is passed via the `Authorization` request header (or `x-api-key` for Anthropic SDKs) — no need to store it in config files. Key must start with `user_` (automatically matched with any prefix, e.g. `Bearer token_user_xxx`):
@@ -31,19 +38,70 @@ curl http://127.0.0.1:3050/v1/chat/completions \
 ```
 commandcode/
 ├── config.json           # Port / log path etc.
+├── config.local.json     # Local overrides (optional; console-saved API key; git/docker-ignored)
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
-├── proxy.mjs             # Single-file proxy core (~1900 lines)
+├── proxy.mjs             # Single-file proxy core + interactive console (~2600 lines)
 ├── Dockerfile            # Container build (node:22-alpine)
 ├── docker-compose.yml    # Container orchestration
 ├── .dockerignore         # Build context exclusions
 ├── .github/
 │   └── workflows/
 │       └── docker-publish.yml  # GHCR multi-arch publish on v* tags
+├── test/
+│   ├── mock-cc-server.mjs      # End-to-end scenario tests (mock upstream, no key needed)
+│   └── tui-smoke.mjs           # TUI smoke tests (model list / fallback warning / key input)
 ├── captured-requests/    # Captured CLI traffic (protocol analysis reference)
 ├── README.md             # This document (English)
 └── README_zh.md          # Chinese documentation
 ```
+
+## Interactive Console (cmd TUI)
+
+`npm start` / `node proxy.mjs` enters a numbered menu when stdout is an interactive terminal. When stdout is not a TTY (Docker, CI, redirection) it stays off and behaviour is identical to previous versions.
+
+```
+────────────────────────────────────────────────────────────
+ Command Code → OpenAI / Anthropic 代理 · 控制台
+ 服务 http://0.0.0.0:3050 │ 运行 3m12s │ 已处理请求 128
+ API Key user_****a1b2 （来源: config.json）
+────────────────────────────────────────────────────────────
+ [1] 查看当前套餐可用模型
+ [2] 强制刷新模型列表（跳过 5 分钟缓存）
+ [3] 服务状态与配置
+ [4] 设置 / 更换 API Key
+ [5] 查看最近日志
+ [6] 清屏
+ [0] 退出（停止代理）
+请输入序号 >
+```
+
+| Key | Action |
+|-----|--------|
+| `1` | List the models **your plan** can use (`GET {apiBase}/provider/v1/models`, scoped to your key) with index, model ID and note |
+| `2` | Force a re-fetch, bypassing the 5-minute cache |
+| `3` | Listen address, uptime, upstream API, model source & cache, request counters |
+| `4` | Set / change the API key (no echo; optionally saved to the project's `config.local.json`) |
+| `5` | Last 40 log lines (in-memory ring buffer, max 300, never written to disk) |
+| `6` | Clear screen |
+| `0` | Exit and stop the proxy (`q` / `exit` also work); press Ctrl+C twice |
+
+Notes:
+
+- **Model list provenance is labeled honestly**: on success it shows `数据来源: Provider API`; on failure (invalid key 401, network error, `useProviderModels` disabled) it states the reason and makes clear the listed entries are the **built-in reference list**, which may contain models your plan cannot use.
+- **API key resolution order**: `CC_API_KEY` / `COMMANDCODE_API_KEY` env → project `config.json` `apiKey` → menu `[4]`. Request-side auth (`Authorization` / `x-api-key`) is unchanged and independent of the console.
+- **Nothing is written to your C: drive**: the console itself creates no files (readline history is memory-only). Only when you answer `y` in menu `[4]` is the key written to `config.local.json` **inside the project directory** (excluded via `.gitignore` / `.dockerignore`, so it is never committed or baked into an image) — never `%APPDATA%`, `%TEMP%`, your home directory or the registry.
+- **Logs never shred the prompt**: runtime logs and upstream errors clear the current input line, print, then redraw `请输入序号 >`.
+- **Clean exit**: shutdown waits for in-flight upstream requests and drains stdout, avoiding an abrupt exit that trips a libuv assertion on Windows (exit code `0xC0000409`).
+
+### Console environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `CC_TUI` | `1`/`on`/`force` to force on, `0`/`off` to force off; default is "on when stdout is a TTY" |
+| `CC_API_KEY` | API key used by the console and `[1]` (alias: `COMMANDCODE_API_KEY`) |
+| `NO_COLOR` | Set to anything to disable colors (already off when not a TTY) |
+| `--no-tui` / `--tui` | CLI flags, take precedence over `CC_TUI` |
 
 ## Configuration
 
@@ -61,6 +119,8 @@ commandcode/
 | `useProviderModels` | `true` | Dynamically fetch model list from Provider API |
 | `modelRefreshIntervalMs` | `300000` | Model list cache refresh interval (5 min) |
 
+An optional `config.local.json` may also be present: same fields as `config.json`, but it **takes precedence** (`config.json` is read first, then overridden by this file). The API key saved by console menu `[4]` lands here; the file is excluded via `.gitignore` / `.dockerignore`, so it is never committed or baked into an image.
+
 ### Environment Variables
 
 | Variable | Overrides |
@@ -71,6 +131,8 @@ commandcode/
 | `PROJECT_SLUG` | `projectSlug` |
 | `LOG_FILE` | `logFile` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
+| `CC_TUI` | Force the interactive console on/off (see above) |
+| `CC_API_KEY` | API key used by the console (not used for request-side auth) |
 
 ## API Endpoints
 
@@ -237,6 +299,8 @@ data: {"type":"message_stop"}
 ### `GET /v1/models`
 
 Returns available model list. Fetched dynamically from Provider API (5 min cache), falls back to hardcoded list on failure.
+
+> Want to know exactly which models **your plan** can use? Press `1` in the console after startup: it fetches the same live list with your API key and prints it with indices; press `2` to force a refresh. If the key is invalid or the network is down, the console says so explicitly instead of passing the fallback list off as your plan's list.
 
 ### `GET /health`
 
@@ -471,4 +535,10 @@ This project is for **educational and research purposes** only.
 ```bash
 # Start with watch mode (auto-reload on file changes)
 npm run dev
+
+# End-to-end pipeline tests (mock upstream; no network or real key required)
+npm test
+
+# TUI smoke tests (model list / 401 fallback warning / key input masking / no disk writes)
+npm run test:tui
 ```

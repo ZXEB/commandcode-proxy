@@ -6,15 +6,22 @@
 
 基于对官方 CLI 网络流量的分析，精确还原了 Command Code API 的请求协议（含设备指纹与生命周期预请求），并实现了多层兼容适配。
 
-**完整功能**：OpenAI Chat Completions + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止） | 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
+**完整功能**：内置 cmd 交互式控制台（TUI，可直接查看当前套餐可用模型）| OpenAI Chat Completions + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止） | 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
 
 **社区**: [Linux.do](https://linux.do) — 一个友好的中文技术社区。
 
 ## 快速开始
 
 ```bash
-npm start        # 启动（仓库自带 config.json，监听 http://0.0.0.0:3050）
+npm start        # 启动（仓库自带 config.json，监听 http://0.0.0.0:3050）并进入交互式控制台
 npm run dev      # watch 模式（文件修改自动重启）
+node proxy.mjs   # 等价启动；不想让 npm 在 C 盘写日志时用这条
+```
+
+启动后 cmd 里是一个带序号的菜单：输入 `1` 即可列出**当前 API Key 对应套餐**可用的模型。想只要纯日志（不要控制台）加 `--no-tui`：
+
+```bash
+node proxy.mjs --no-tui
 ```
 
 API Key 通过 `Authorization` 请求头（Anthropic SDK 可用 `x-api-key`）传入，**无需配置到文件中**。Key 必须以 `user_` 开头（自动匹配任意前缀，如 `Bearer token_user_xxx`）：
@@ -31,19 +38,70 @@ curl http://127.0.0.1:3050/v1/chat/completions \
 ```
 commandcode/
 ├── config.json           # 端口 / 日志路径等
+├── config.local.json     # 本地覆盖（可选，控制台保存的 API Key；已 gitignore / dockerignore）
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
-├── proxy.mjs             # 单文件核心代理（~1900 行）
+├── proxy.mjs             # 单文件核心代理 + 交互式控制台（~2600 行）
 ├── Dockerfile            # 容器构建文件（node:22-alpine）
 ├── docker-compose.yml    # 容器编排
 ├── .dockerignore         # 构建上下文排除规则
 ├── .github/
 │   └── workflows/
 │       └── docker-publish.yml  # 打 v* tag 时自动发布 GHCR 多架构镜像
+├── test/
+│   ├── mock-cc-server.mjs      # 链路端到端场景测试（模拟上游，免 Key）
+│   └── tui-smoke.mjs           # cmd TUI 冒烟测试（模型列表 / 回退提示 / Key 输入）
 ├── captured-requests/    # CLI 抓包数据（协议逆向参考）
 ├── README.md             # 英文文档
 └── README_zh.md          # 本文档（中文）
 ```
+
+## 交互式控制台（cmd TUI）
+
+`npm start` / `node proxy.mjs` 在**交互式终端**里会自动进入带序号的菜单；stdout 不是 TTY（Docker、CI、重定向）时自动关闭，行为与旧版一致。
+
+```
+────────────────────────────────────────────────────────────
+ Command Code → OpenAI / Anthropic 代理 · 控制台
+ 服务 http://0.0.0.0:3050 │ 运行 3m12s │ 已处理请求 128
+ API Key user_****a1b2 （来源: config.json）
+────────────────────────────────────────────────────────────
+ [1] 查看当前套餐可用模型
+ [2] 强制刷新模型列表（跳过 5 分钟缓存）
+ [3] 服务状态与配置
+ [4] 设置 / 更换 API Key
+ [5] 查看最近日志
+ [6] 清屏
+ [0] 退出（停止代理）
+请输入序号 >
+```
+
+| 序号 | 作用 |
+|------|------|
+| `1` | 列出**当前套餐可用模型**（`GET {apiBase}/provider/v1/models`，按 Key 区分套餐），带序号、模型 ID、备注 |
+| `2` | 跳过 5 分钟缓存重新拉取（刚升级/换套餐后用） |
+| `3` | 监听地址、运行时长、上游 API、模型来源与缓存、请求计数 |
+| `4` | 设置 / 更换 API Key（输入不回显；可选择性写入项目内 `config.local.json`） |
+| `5` | 最近 40 条日志（内存环形缓冲，最多 300 条，不落盘） |
+| `6` | 清屏 |
+| `0` | 退出并停止代理（`q` / `exit` 等价）；Ctrl+C 连按两次也可退出 |
+
+要点：
+
+- **模型列表来源如实标注**：成功时显示 `数据来源: Provider API`；失败（Key 无效 401、网络错误、关闭了 `useProviderModels`）会明确提示原因，并说明下面列的是**内置参考列表**，可能包含当前套餐不可用的模型。
+- **API Key 解析顺序**：环境变量 `CC_API_KEY` / `COMMANDCODE_API_KEY` → 项目内 `config.json` 的 `apiKey` → 菜单 `[4]` 手动输入。请求侧（`Authorization` / `x-api-key`）仍然照旧，与控制台无关。
+- **不写 C 盘**：控制台自身不落任何文件（readline 历史仅存在内存里）；只有你在菜单 `[4]` 里选择 `y` 时，才会把 Key 写进**项目目录内**的 `config.local.json`（该文件已在 `.gitignore` / `.dockerignore` 里排除，不会被提交或打进镜像）。不会碰 `%APPDATA%` / `%TEMP%` / 家目录 / 注册表。
+- **日志不撕界面**：代理运行日志、上游错误都会先清掉当前输入行再打印，然后重绘 `请输入序号 >`，可以边跑边看日志。
+- **退出干净**：退出前会等在途的上游请求收尾并排空 stdout，避免 Windows 上硬退撞 libuv 断言（退出码 `0xC0000409`）。
+
+### 控制台相关环境变量
+
+| 变量 | 说明 |
+|------|------|
+| `CC_TUI` | `1`/`on`/`force` 强制启用，`0`/`off` 强制关闭；默认"是 TTY 就启用" |
+| `CC_API_KEY` | 控制台与 `[1]` 模型列表使用的 API Key（等价 `COMMANDCODE_API_KEY`） |
+| `NO_COLOR` | 设为任意值即关闭颜色（非 TTY 下本来就不上色） |
+| `--no-tui` / `--tui` | 命令行开关，优先级高于 `CC_TUI` |
 
 ## 配置
 
@@ -61,6 +119,8 @@ commandcode/
 | `useProviderModels` | `true` | 从 Provider API 动态拉取模型列表 |
 | `modelRefreshIntervalMs` | `300000` | 模型列表缓存刷新间隔（5min） |
 
+另有可选的 `config.local.json`：字段与 `config.json` 完全一致，**优先级更高**（先读 `config.json`，再用它覆盖）。控制台 `[4]` 保存的 API Key 就落在这里；该文件已在 `.gitignore` / `.dockerignore` 中排除，不会被提交或打进镜像。
+
 ### 环境变量
 
 | 变量 | 对应 config 字段 |
@@ -71,6 +131,8 @@ commandcode/
 | `PROJECT_SLUG` | `projectSlug` |
 | `LOG_FILE` | `logFile` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
+| `CC_TUI` | 强制开/关交互式控制台（见上文） |
+| `CC_API_KEY` | 控制台用的 API Key（不参与请求侧鉴权） |
 
 ## API 接口
 
@@ -237,6 +299,8 @@ data: {"type":"message_stop"}
 ### `GET /v1/models`
 
 返回可用模型列表。优先从 Provider API 动态拉取（5min 缓存），失败回退硬编码列表。
+
+> 想知道**你的套餐**到底能用哪些模型？启动后在控制台按 `1`：它用你的 API Key 拉同一份实时列表并带序号打印；拉了缓存想立刻刷新按 `2`。踩到 Key 无效/断网时，控制台会明确告诉你是回退列表，不会假装那是套餐列表。
 
 ### `GET /health`
 
@@ -473,4 +537,10 @@ npm run docker:build:multi
 ```bash
 # 带 watch 模式启动（文件修改自动重启）
 npm run dev
+
+# 链路端到端测试（模拟上游，不需要外网与真实 Key）
+npm test
+
+# cmd TUI 冒烟测试（模型列表 / 401 回退提示 / Key 输入不回显 / 不写盘）
+npm run test:tui
 ```

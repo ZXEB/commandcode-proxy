@@ -56,7 +56,9 @@ commandcode/
 │       └── docker-publish.yml  # GHCR multi-arch publish on v* tags
 ├── test/
 │   ├── mock-cc-server.mjs      # End-to-end scenario tests (mock upstream, no key needed)
-│   └── tui-smoke.mjs           # TUI smoke tests (model list / fallback warning / key input)
+│   └── tui-smoke.mjs           # TUI smoke tests (model list / quota / fallback warning / key input)
+├── docs/
+│   └── QUOTA.md          # How the plan-quota display works (protocol / math / rendering)
 ├── captured-requests/    # Captured CLI traffic (protocol analysis reference)
 ├── README.md             # This document (English)
 └── README_zh.md          # Chinese documentation
@@ -125,6 +127,8 @@ Quota comes from Command Code's own billing endpoints — the same ones the offi
 - **remaining** = monthly + purchased + free credits;
 - **credit pool** = when the subscription is active, `max(plan's nominal credits, monthly remaining)` + purchased + free; otherwise spent + remaining;
 - **spent** = `totalCost` since the start of the current billing period.
+
+> 📖 Implementation details (endpoint protocol, field pitfalls, parallelism and degradation strategy, honesty-by-design) are in **[docs/QUOTA.md](docs/QUOTA.md)** (written in Chinese).
 
 **On latency**: these billing endpoints are simply slow (measured: `whoami` 7–17s, `subscriptions` up to 20s+, `summary` ~8s — while DNS takes 2ms, so the slowness is server-side, not your network). Therefore:
 

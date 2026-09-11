@@ -56,7 +56,9 @@ commandcode/
 │       └── docker-publish.yml  # 打 v* tag 时自动发布 GHCR 多架构镜像
 ├── test/
 │   ├── mock-cc-server.mjs      # 链路端到端场景测试（模拟上游，免 Key）
-│   └── tui-smoke.mjs           # cmd TUI 冒烟测试（模型列表 / 回退提示 / Key 输入）
+│   └── tui-smoke.mjs           # cmd TUI 冒烟测试（模型列表 / 额度 / 回退提示 / Key 输入）
+├── docs/
+│   └── QUOTA.md          # 套餐额度显示的实现说明（协议来源 / 计算 / 渲染）
 ├── captured-requests/    # CLI 抓包数据（协议逆向参考）
 ├── README.md             # 英文文档
 └── README_zh.md          # 本文档（中文）
@@ -125,6 +127,8 @@ commandcode/
 - **剩余** = 月度剩余 + 加油包剩余 + 赠送剩余；
 - **额度池** = 订阅有效时 `max(套餐标称额度, 月度剩余)` + 加油包 + 赠送，否则 = 已用 + 剩余；
 - **已用** = 本计费周期起点以来的 `totalCost`。
+
+> 📖 实现细节（端点协议、字段坑、并行与降级策略、诚实性设计）见 **[docs/QUOTA.md](docs/QUOTA.md)**。
 
 **关于慢**：这几个账单接口本身就很慢（实测 `whoami` 7~17s、`subscriptions` 最高 20s+、`summary` ~8s，而 DNS 只要 2ms——慢在 CC 服务端，不是本地网络）。因此：
 

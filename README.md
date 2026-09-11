@@ -90,7 +90,7 @@ commandcode/
 |-----|--------|
 | `1` | List the models **your plan** can use (`GET {apiBase}/provider/v1/models`, scoped to your key) with index, model ID and note |
 | `2` | Force a re-fetch, bypassing the 5-minute cache |
-| `3` | Show **your plan quota**: three usage windows (5-hour / weekly / monthly) with progress bars, remaining credits and reset countdowns, plus the credit pool, spend this period, billing cycle and **refresh time**. Serves a 30-second cache; use `[8]` to force a refresh |
+| `3` | Show **your plan quota**: three usage windows (5-hour / weekly / monthly) with progress bars, remaining credits and reset countdowns, plus the credit pool, spend this period, **cumulative usage (tokens, in millions)**, billing cycle and **refresh time**. Serves a 30-second cache; use `[8]` to force a refresh |
 | `4` | Listen address, uptime, upstream API, model source & cache, request counters |
 | `5` | Set / change the API key (no echo; optionally saved to the project's `config.local.json`) |
 | `6` | Last 40 log lines (in-memory ring buffer, max 300, never written to disk) |
@@ -112,6 +112,8 @@ commandcode/
 
  额度池：剩余 $4.93 / $10.00   已用 $5.04
          其中 月度 $4.93 · 加油包 $0.00 · 赠送 $0.00
+ 累计用量：233.4M tokens（输入 231.9M · 输出 1.5M） · 3,012 次请求 · 均次 $0.0017
+           统计自本计费周期起点
  周期：2026/8/25 14:03:54 → 2026/9/25 14:03:54 · 还剩 14 天
  刷新时间：2026/9/11 22:54:31（耗时 6s · 数据来源 CC 账单接口）
 ```
@@ -126,8 +128,11 @@ Quota comes from Command Code's own billing endpoints — the same ones the offi
 
 - **remaining** = monthly + purchased + free credits;
 - **credit pool** = when the subscription is active, `max(plan's nominal credits, monthly remaining)` + purchased + free; otherwise spent + remaining;
-- **spent** = `totalCost` since the start of the current billing period.
+- **spent** = `totalCost` since the start of the current billing period;
+- **cumulative usage** = tokens consumed within the current billing period, shown in millions (e.g. `233.4M`) with an input/output split, request count and average cost per request.
 
+> ⚠️ The `since` parameter of `usage/summary` is ignored by the server in practice (passing year 2020 returns identical numbers and `periodBasis` stays `billing-period`), so this is the **current billing period's** total, not all-time history — the UI says so explicitly.
+>
 > 📖 Implementation details (endpoint protocol, field pitfalls, parallelism and degradation strategy, honesty-by-design) are in **[docs/QUOTA.md](docs/QUOTA.md)** (written in Chinese).
 
 **On latency**: these billing endpoints are simply slow (measured: `whoami` 7–17s, `subscriptions` up to 20s+, `summary` ~8s — while DNS takes 2ms, so the slowness is server-side, not your network). Therefore:

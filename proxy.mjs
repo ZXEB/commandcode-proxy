@@ -2326,6 +2326,16 @@ function projectQuota({ whoami, credits, subscription, summary }, fetchedAt = Da
     },
     windowLimits: credits?.windowLimits ?? null,
     summary: summary ?? null,
+    // 累计用量：服务端只按计费周期聚合（periodBasis 恒为 billing-period，
+    // 传 since=1970 也不会变），所以口径是「本计费周期累计」而非全部历史
+    tokens: {
+      total: Math.max(0, summary?.totalTokens ?? 0),
+      input: Math.max(0, summary?.totalTokensIn ?? 0),
+      output: Math.max(0, summary?.totalTokensOut ?? 0),
+    },
+    requests: Number.isFinite(summary?.totalCount) ? summary.totalCount : null,
+    avgCost: Number.isFinite(summary?.averageCost) ? summary.averageCost : null,
+    periodBasis: summary?.periodBasis ?? null,
     daysLeft,
     cycleEnd: sub?.currentPeriodEnd ?? null,
     fetchedAt,
@@ -2648,6 +2658,24 @@ function formatCredits(n) {
   return `$${Number(n || 0).toFixed(2)}`;
 }
 
+// Token 数量按官方口径显示成 M（百万）：233370995 → 233.4M
+function formatTokens(n) {
+  const v = Number(n || 0);
+  if (!Number.isFinite(v) || v <= 0) return '0';
+  if (v >= 1e9) return `${(v / 1e9).toFixed(2)}B`;
+  if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
+  if (v >= 1e3) return `${(v / 1e3).toFixed(1)}K`;
+  return String(Math.round(v));
+}
+
+// 单次均价常常小于 1 分钱，固定两位会显示成 $0.00，这里按量级提高精度
+function formatSmallCredits(n) {
+  const v = Number(n || 0);
+  if (!Number.isFinite(v) || v <= 0) return null;
+  if (v < 0.01) return `$${v.toFixed(4)}`;
+  return `$${v.toFixed(2)}`;
+}
+
 function progressBar(percent, width = 20) {
   const clamped = Math.max(0, Math.min(100, percent));
   const filled = Math.round((width * clamped) / 100);
@@ -2820,6 +2848,18 @@ async function tuiShowQuota(force = false) {
       ANSI.dim,
     ));
     if (c.belowThreshold) out.push(paint(` ⚠️  额度已低于告警阈值 ${formatCredits(c.creditThreshold)}`, ANSI.yellow));
+  }
+
+  // 累计用量（与官方 CLI 的 /usage 面板同源，取自 usage/summary）
+  if (v.tokens && v.tokens.total > 0) {
+    const extras = [];
+    if (v.requests) extras.push(`${v.requests.toLocaleString()} 次请求`);
+    const avg = formatSmallCredits(v.avgCost);
+    if (avg) extras.push(`均次 ${avg}`);
+    out.push(` 累计用量：${paint(formatTokens(v.tokens.total), ANSI.bold)} tokens`
+      + paint(`（输入 ${formatTokens(v.tokens.input)} · 输出 ${formatTokens(v.tokens.output)}）`, ANSI.dim)
+      + (extras.length ? paint(` · ${extras.join(' · ')}`, ANSI.dim) : ''));
+    out.push(paint(`           ${v.periodBasis === 'billing-period' || !v.periodBasis ? '统计自本计费周期起点' : `统计口径 ${v.periodBasis}`}`, ANSI.dim));
   }
 
   if (v.subscription?.currentPeriodEnd) {

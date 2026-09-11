@@ -104,7 +104,19 @@ const mock = http.createServer((req, res) => {
         return;
       }
       if (path === '/alpha/usage/summary') {
-        send(200, { totalCost: 25.5 });
+        // 与线上真实返回一致的字段（含 token 累计）
+        send(200, {
+          totalCount: 2868,
+          totalCost: 25.5,
+          averageCost: 0.008892,
+          successRate: 100,
+          completedCount: 2868,
+          failedCount: 0,
+          totalTokensIn: 198045411,
+          totalTokensOut: 1448250,
+          totalTokens: 199493661,
+          periodBasis: 'billing-period',
+        });
         return;
       }
     }
@@ -258,6 +270,12 @@ async function main() {
   check(b2.out.includes('额度池：剩余 $66.00 / $91.50'), '额度池与剩余计算正确（对齐 CLI projectUsageView）');
   check(b2.out.includes('已用 $25.50'), '本期已花费正确（usage/summary 的 totalCost）');
   check(b2.out.includes('其中 月度 $54.50 · 加油包 $10.00 · 赠送 $1.50'), '三类额度拆分正确');
+  // 累计用量：199493661 → 199.5M（按官方口径以 M 显示）
+  check(b2.out.includes('累计用量：199.5M tokens'), '累计用量按 M 显示（199493661 → 199.5M）');
+  check(b2.out.includes('输入 198.0M · 输出 1.4M'), '输入/输出 tokens 分别折算');
+  check(b2.out.includes('2,868 次请求'), '显示请求次数（带千分位）');
+  check(b2.out.includes('均次 $0.0089'), '单次均价小于 1 分时提高精度（不显示成 $0.00）');
+  check(b2.out.includes('统计自本计费周期起点'), '如实标注统计口径（服务端只按周期聚合）');
   check(b2.out.includes('账号：tester') && b2.out.includes('组织 tester-org'), '展示账号与组织');
   check(b2.out.includes('还剩'), '展示周期剩余天数');
   check(/刷新时间：\d{4}\/\d+\/\d+/.test(b2.out), '显示刷新时间（绝对时刻）');

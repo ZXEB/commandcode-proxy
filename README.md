@@ -528,14 +528,16 @@ The proxy receives OpenAI `image_url` format and converts it to the above CC for
 
 ### Pull from GHCR
 
-Pre-built multi-arch images (`linux/amd64` + `linux/arm64`) are published to the GitHub Container Registry automatically on every `v*` tag via GitHub Actions:
+Pre-built multi-arch images (`linux/amd64` + `linux/arm64`) are published to the GitHub Container Registry automatically on every `v*` tag via GitHub Actions.
+
+> ⚠️ The command below pulls the **upstream project's image** (`maxeaglet/commandcode-proxy`), which does **not** include this repository's interactive console and other changes. To run this repository's code, build it yourself (see "Build from Source" below), or push a `v*` tag so Actions publishes to this repo's own namespace (`ghcr.io/<your-user>/commandcode-proxy`).
 
 ```bash
 docker pull ghcr.io/maxeaglet/commandcode-proxy:latest
 docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/maxeaglet/commandcode-proxy:latest
 ```
 
-The `latest` tag is updated on each release. The image is public — no login required to pull.
+The `latest` tag is updated on each release. The upstream image is public — no login required to pull.
 
 ### Quick Start (docker compose)
 
@@ -574,8 +576,9 @@ npm run docker:build:multi
 This project is for **educational and research purposes** only.
 
 - **Unofficial**: This project is not affiliated with Command Code in any way.
+- **Origin & Credits**: This repository is a derivative of [MAXeaglet/commandcode-proxy](https://github.com/maxeaglet/commandcode-proxy) (MIT); the original copyright notice is retained in [LICENSE](LICENSE). It adds a built-in interactive console (cmd TUI) for listing the models your plan can use, 5-hour / weekly / monthly usage windows and quota, service status, plus a one-click `start.bat`.
 - **Personal Use**: Users assume all responsibility. Please comply with the [Command Code Terms of Service](https://commandcode.ai/tos).
-- **API Key**: This project does not collect, upload, or leak your API Key. The key is sent per request via the `Authorization: Bearer <key>` or `x-api-key` header and is never logged; an optional `apiKey` field in `config.json` serves only as a local fallback and never leaves your machine.
+- **API Key**: This project does not collect, upload, or leak your API Key. The key is sent per request via the `Authorization: Bearer <key>` or `x-api-key` header and is never logged; an optional `apiKey` field in `config.json` and the console-saved `config.local.json` serve only as local fallbacks and never leave your machine (`config.local.json` is excluded via `.gitignore` / `.dockerignore`).
 - **Compliance**: The protocol is based on passive observation of local CLI network traffic. No unauthorized access, cracking, or tampering of the server has been performed.
 - **Account Risk**: Keep usage frequency consistent with normal CLI usage. Extremely high concurrent calls may trigger risk controls.
 

@@ -528,14 +528,16 @@ CLI 发送图片的格式：
 
 ### 从 GHCR 拉取
 
-每次打 `v*` tag 时 GitHub Actions 会自动构建并推送多架构镜像（`linux/amd64` + `linux/arm64`）到 GitHub Container Registry：
+每次打 `v*` tag 时 GitHub Actions 会自动构建并推送多架构镜像（`linux/amd64` + `linux/arm64`）到 GitHub Container Registry。
+
+> ⚠️ 下面这条命令拉的是**原项目（maxeaglet/commandcode-proxy）的镜像**，其中**不包含**本仓库的交互式控制台等改动。要用本仓库的代码，请按下面的「从源码构建」自行构建，或打 tag 后让 Actions 发布到本仓库自己的命名空间（`ghcr.io/<你的用户名>/commandcode-proxy`）。
 
 ```bash
 docker pull ghcr.io/maxeaglet/commandcode-proxy:latest
 docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/maxeaglet/commandcode-proxy:latest
 ```
 
-每次发版都会更新 `latest` 标签。镜像为公共可见，拉取无需登录。
+每次发版都会更新 `latest` 标签。上游镜像为公共可见，拉取无需登录。
 
 ### 快速启动 (docker compose)
 
@@ -574,8 +576,9 @@ npm run docker:build:multi
 本项目仅供**学习和研究**使用。
 
 - **非官方**：本项目与 Command Code 无任何关联，非官方产品。
+- **来源与致谢**：本仓库基于 [MAXeaglet/commandcode-proxy](https://github.com/maxeaglet/commandcode-proxy)（MIT）修改而来，原作者版权声明保留在 [LICENSE](LICENSE) 中。本仓库在其基础上新增了内置交互式控制台（cmd TUI）：查看当前套餐可用模型、5 小时 / 每周 / 每月用量窗口与额度、服务状态，以及 `start.bat` 一键启动等。
 - **个人使用**：使用者应自行承担所有责任。请遵守 [Command Code 服务条款](https://commandcode.ai/tos)。
-- **API Key**：本项目不会收集、上传或泄露你的 API Key。Key 通过每次请求的 `Authorization: Bearer <key>` 或 `x-api-key` 头传入，日志中不记录；`config.json` 中的可选 `apiKey` 字段仅作本地兜底，不会离开你的机器。
+- **API Key**：本项目不会收集、上传或泄露你的 API Key。Key 通过每次请求的 `Authorization: Bearer <key>` 或 `x-api-key` 头传入，日志中不记录；`config.json` 中的可选 `apiKey` 字段与控制台保存的 `config.local.json` 仅作本地兜底，不会离开你的机器（`config.local.json` 已在 `.gitignore` / `.dockerignore` 中排除）。
 - **合规性**：协议基于对本地 CLI 网络流量的被动观察，未对服务端进行任何未授权访问、破解或篡改。
 - **账号风险**：建议和正常 CLI 使用频率保持一致，超高并发调用可能触发风控。
 

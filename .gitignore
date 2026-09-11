@@ -8,4 +8,6 @@ stdout.txt
 stderr.txt
 captured-requests/
 config.local.json
+*.local.json
+.zcode/
 

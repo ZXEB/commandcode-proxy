@@ -12,15 +12,20 @@ Built by analyzing official CLI network traffic to accurately replicate the Comm
 
 ## Quick Start
 
+**Windows one-click**: double-click `start.bat` (it switches to its own folder, sets a UTF-8 code page, and keeps the window open with a hint if Node.js is missing).
+
+From a shell:
+
 ```bash
 npm start        # Start (repo config.json listens on http://0.0.0.0:3050) and enter the interactive console
 npm run dev      # Watch mode (auto-reload on file changes)
 node proxy.mjs   # Same start, without npm writing logs to your C: drive
 ```
 
-Once started, cmd shows a numbered menu: type `1` to list the models **your API key's plan** can use. For plain log output only, add `--no-tui`:
+Once started, cmd shows a numbered menu and **prints nothing else on its own** — press `1` to list the models your plan can use, or `3` for your plan quota. For plain log output only, add `--no-tui`:
 
 ```bash
+start.bat --no-tui
 node proxy.mjs --no-tui
 ```
 
@@ -37,6 +42,7 @@ curl http://127.0.0.1:3050/v1/chat/completions \
 
 ```
 commandcode/
+├── start.bat             # Windows one-click launcher (just double-click)
 ├── config.json           # Port / log path etc.
 ├── config.local.json     # Local overrides (optional; console-saved API key; git/docker-ignored)
 ├── LICENSE               # MIT License
@@ -82,7 +88,7 @@ commandcode/
 |-----|--------|
 | `1` | List the models **your plan** can use (`GET {apiBase}/provider/v1/models`, scoped to your key) with index, model ID and note |
 | `2` | Force a re-fetch, bypassing the 5-minute cache |
-| `3` | Show **your plan quota**: plan name / subscription status / credits remaining / credit pool / spent this period with a progress bar / billing period and days left. Serves a 30-second cache; use `[8]` to force a refresh |
+| `3` | Show **your plan quota**: three usage windows (5-hour / weekly / monthly) with progress bars, remaining credits and reset countdowns, plus the credit pool, spend this period, billing cycle and **refresh time**. Serves a 30-second cache; use `[8]` to force a refresh |
 | `4` | Listen address, uptime, upstream API, model source & cache, request counters |
 | `5` | Set / change the API key (no echo; optionally saved to the project's `config.local.json`) |
 | `6` | Last 40 log lines (in-memory ring buffer, max 300, never written to disk) |
@@ -94,15 +100,25 @@ commandcode/
 
 ```
 当前套餐额度
- 套餐：Go（active）   标称额度 $10.00/月
+ 套餐：Go（active）   $10.00/月
  账号：your-name
- 剩余：$5.04 / 额度池 $10.00
- 已用：$4.95  [██████████░░░░░░░░░░] 49.6%
-       其中 月度 $5.04 · 加油包 $0.00 · 赠送 $0.00
- 周期：2026/8/25 14:03:54 → 2026/9/25 14:03:54 · 还剩 15 天
 
- 数据来源: CC 账单接口 · 刚刚拉取（耗时 4s）
+ 用量窗口
+ 5小时  [█░░░░░░░░░░░░░░░░░░░]   3%  剩余 $2.90 · 10分后重置（23:04）
+ 每周   [██████░░░░░░░░░░░░░░]  31%  剩余 $4.14 · 16小时51分后重置（2026/9/12 15:45）
+ 每月   [██████████░░░░░░░░░░]  51%  剩余 $4.93 / $10.00 · 14天后续期（2026/9/25 14:03）
+
+ 额度池：剩余 $4.93 / $10.00   已用 $5.04
+         其中 月度 $4.93 · 加油包 $0.00 · 赠送 $0.00
+ 周期：2026/8/25 14:03:54 → 2026/9/25 14:03:54 · 还剩 14 天
+ 刷新时间：2026/9/11 22:54:31（耗时 6s · 数据来源 CC 账单接口）
 ```
+
+The three usage windows mirror the official CLI's `/usage` panel:
+
+- **5-hour / weekly** come from `windowLimits` in the `billing/credits` response — note it is a **top-level field** alongside `credits`, its windows use `used` / `cap`, and `resetAt` is epoch milliseconds. The bar is `used/cap`, colored by utilization (<70% green, ≥70% yellow, ≥90% red), and an exceeded window is flagged in red.
+- **Monthly** is usually absent from `windowLimits`, so it is computed from the plan cycle: `spent / credit pool`, with the renewal time.
+- Every window shows the **time until reset plus the reset clock** (time-only if it resets today, with a date otherwise), and the last line is the **refresh time** (absolute) with the fetch duration.
 
 Quota comes from Command Code's own billing endpoints — the same ones the official CLI's `/usage` panel uses (`/alpha/whoami`, `/alpha/billing/credits`, `/alpha/billing/subscriptions`, `/alpha/usage/summary`). They are read-only GETs and consume no credits. The math matches the CLI's `projectUsageView`:
 
@@ -120,7 +136,7 @@ Quota comes from Command Code's own billing endpoints — the same ones the offi
 
 Notes:
 
-- **The menu is reprinted after every command's output**, so you never have to scroll back up to pick the next option.
+- **The menu is reprinted after every command's output**, so you never have to scroll back up to pick the next option. On startup the console only prints the menu — it does not auto-fetch and dump the model list.
 - **Model list provenance is labeled honestly**: on success it shows `数据来源: Provider API`; on failure (invalid key 401, network error, `useProviderModels` disabled) it states the reason and makes clear the listed entries are the **built-in reference list**, which may contain models your plan cannot use. That built-in list is an offline fallback and can lag behind production (which carries dozens of models) — with a valid key, trust the live result from `[1]`.
 - **API key resolution order**: `CC_API_KEY` / `COMMANDCODE_API_KEY` env → project `config.local.json` → `config.json` → menu `[4]`. Request-side auth (`Authorization` / `x-api-key`) is unchanged and independent of the console. If a terminal paste repeats the same key several times, the copies are collapsed into one (with an explicit notice) instead of saving one giant invalid key.
 - **Nothing is written to your C: drive**: the console itself creates no files (readline history is memory-only). Only when you answer `y` in menu `[4]` is the key written to `config.local.json` **inside the project directory** (excluded via `.gitignore` / `.dockerignore`, so it is never committed or baked into an image) — never `%APPDATA%`, `%TEMP%`, your home directory or the registry.

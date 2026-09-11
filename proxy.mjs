@@ -2282,7 +2282,10 @@ async function quotaGet(apiKey, endpoint) {
 }
 
 // 把几个接口的原始数据摊平成视图（算法与官方 CLI 的 projectUsageView 一致）
-function projectQuota({ whoami, credits, subscription, summary }) {
+function projectQuota({ whoami, credits, subscription, summary }, fetchedAt = Date.now()) {
+  // 注意：windowLimits 是 credits 响应的「顶层」字段，和 credits.credits 平级。
+  // 官方 CLI 也是这么读的（projectUsageView 里 e.credits?.windowLimits，
+  // 其中 e.credits 指向整个响应体）。
   const sub = subscription?.data ?? null;
   const c = credits?.credits ?? null;
   const plan = getPlanInfo(sub?.planId ?? c?.planId ?? '');
@@ -2318,10 +2321,14 @@ function projectQuota({ whoami, credits, subscription, summary }) {
     credits: {
       monthlyRemaining, purchasedRemaining, freeRemaining, totalRemaining,
       totalSpent, totalPool, usagePercent, hasCreditsInfo,
+      creditThreshold: c?.creditThreshold ?? null,
+      belowThreshold: c?.belowThreshold ?? false,
     },
-    windowLimits: c?.windowLimits ?? null,
+    windowLimits: credits?.windowLimits ?? null,
     summary: summary ?? null,
     daysLeft,
+    cycleEnd: sub?.currentPeriodEnd ?? null,
+    fetchedAt,
   };
 }
 
@@ -2402,7 +2409,7 @@ async function doFetchQuota(apiKey, { force = false } = {}) {
     }
 
     const raw = { whoami, credits, subscription, summary };
-    const view = projectQuota(raw);
+    const view = projectQuota(raw, now);
     quotaCache = { at: now, view, raw };
     log('info', 'Fetched plan quota', {
       plan: view.plan?.name ?? subscription?.data?.planId ?? 'unknown',
@@ -2653,29 +2660,88 @@ function formatDateTime(v) {
   return Number.isNaN(d.getTime()) ? String(v) : d.toLocaleString();
 }
 
-// windowLimits 的结构在 CLI 里没有渲染逻辑可参考，这里做防御式展示：
-// 认得常见字段就按窗口列出来，认不得就原样 JSON —— 绝不猜着编。
-function formatWindowLimits(limits) {
-  if (!limits) return [];
-  const entries = Array.isArray(limits)
-    ? limits.map((v, i) => [v?.window ?? v?.label ?? v?.name ?? `窗口 ${i + 1}`, v])
-    : Object.entries(limits);
-  if (!entries.length) return [];
+// 紧凑时长（对齐官方 CLI 的 formatDuration）：2d 3h / 3h 12m / 45m
+function formatShortDuration(ms) {
+  const minutes = Math.max(1, Math.ceil(ms / 60000));
+  const d = Math.floor(minutes / 1440);
+  const h = Math.floor((minutes % 1440) / 60);
+  const m = minutes % 60;
+  if (d > 0) return h > 0 ? `${d}天${h}小时` : `${d}天`;
+  if (h > 0) return m > 0 ? `${h}小时${m}分` : `${h}小时`;
+  return `${m}分`;
+}
 
-  const out = [paint('  限流窗口', ANSI.bold)];
-  for (const [label, v] of entries) {
-    if (v === null || typeof v !== 'object') { out.push(`    ${label}: ${v}`); continue; }
-    const used = v.used ?? v.consumed ?? v.current;
-    const limit = v.limit ?? v.total ?? v.max;
-    const remaining = v.remaining ?? (typeof used === 'number' && typeof limit === 'number' ? limit - used : undefined);
-    const resetAt = v.resetAt ?? v.resetsAt ?? v.resetTime ?? v.windowEnd;
-    const bits = [];
-    if (limit !== undefined) bits.push(`用量 ${used ?? '?'} / ${limit}`);
-    if (remaining !== undefined) bits.push(`剩余 ${remaining}`);
-    if (resetAt) bits.push(`重置 ${formatDateTime(resetAt)}`);
-    out.push(`    ${label}: ${bits.length ? bits.join(' · ') : JSON.stringify(v)}`);
+// 重置时刻：今天只显示时间，别的日子带上日期（对齐官方 formatResetClock）
+function formatResetClock(tsMs) {
+  const d = new Date(tsMs);
+  const time = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  return new Date().toDateString() === d.toDateString() ? time : `${d.toLocaleDateString()} ${time}`;
+}
+
+// windowLimits.resetAt 是 epoch 毫秒；也兼容 ISO 字符串与秒级时间戳
+function toEpochMs(v) {
+  if (typeof v === 'number' && Number.isFinite(v)) return v < 1e12 ? v * 1000 : v;
+  if (typeof v === 'string') {
+    const t = Date.parse(v);
+    if (!Number.isNaN(t)) return t;
   }
-  return out;
+  return null;
+}
+
+function usageColor(percent) {
+  if (percent >= 90) return ANSI.red;
+  if (percent >= 70) return ANSI.yellow;
+  return ANSI.green;
+}
+
+// 一条用量窗口：5小时 / 每周 / 每月
+// 形如：` 5小时   [██░░░░░░]   2%  剩余 $2.93 · 3小时12分后重置 (21:04)`
+function renderUsageMeter(label, used, cap, resetAtMs) {
+  const percent = cap > 0 ? Math.min(100, (used / cap) * 100) : 0;
+  const color = usageColor(percent);
+  const remaining = Math.max(0, cap - used);
+
+  let tail = `剩余 ${formatCredits(remaining)}`;
+  if (resetAtMs && resetAtMs > Date.now()) {
+    tail += ` · ${formatShortDuration(resetAtMs - Date.now())}后重置（${formatResetClock(resetAtMs)}）`;
+  }
+  return ` ${padEndW(label, 7)}${paint(progressBar(percent, 20), color)} ${paint(`${Math.round(percent)}%`.padStart(4), ANSI.bold, color)}  ${tail}`;
+}
+
+// 从 windowLimits 里挑出已知窗口（5小时 / 每周），未知窗口也如实列出
+function renderWindowLimits(limits) {
+  if (!limits || limits.limited === false) return [];
+
+  const known = [
+    ['5小时', limits.fiveHour ?? limits.five_hour ?? null],
+    ['每周', limits.weekly ?? null],
+    ['每月', limits.monthly ?? null],
+  ].filter(([, w]) => w && typeof w === 'object');
+
+  const knownKeys = new Set(['limited', 'exceeded', 'fiveHour', 'five_hour', 'weekly', 'monthly']);
+  const extras = Object.entries(limits)
+    .filter(([k, v]) => !knownKeys.has(k) && v && typeof v === 'object')
+    .map(([k, v]) => [k, v]);
+
+  const rows = [];
+  for (const [label, w] of [...known, ...extras]) {
+    const cap = w.cap ?? w.limit ?? w.total ?? 0;
+    const used = w.used ?? w.consumed ?? w.current ?? 0;
+    rows.push(renderUsageMeter(label, used, cap, toEpochMs(w.resetAt ?? w.resetsAt ?? w.resetTime)));
+    if (w.exceeded) rows.push(paint(`         ⚠️  该窗口已超限`, ANSI.red));
+  }
+  return rows;
+}
+
+// 每月窗口：服务端 windowLimits 里通常没有 monthly，用套餐周期额度自己算一条
+function renderCycleMeter(v) {
+  const c = v.credits;
+  if (!c.hasCreditsInfo || c.totalPool <= 0) return null;
+  const percent = Math.min(100, ((c.totalPool - c.totalRemaining) / c.totalPool) * 100);
+  const resetAt = toEpochMs(v.cycleEnd);
+  const tail = `剩余 ${formatCredits(c.totalRemaining)} / ${formatCredits(c.totalPool)}`
+    + (v.daysLeft !== null ? ` · ${v.daysLeft}天后续期（${formatResetClock(resetAt ?? Date.now())}）` : '');
+  return ` ${padEndW('每月', 7)}${paint(progressBar(percent, 20), usageColor(percent))} ${paint(`${Math.round(percent)}%`.padStart(4), ANSI.bold, usageColor(percent))}  ${tail}`;
 }
 
 async function tuiShowQuota(force = false) {
@@ -2723,21 +2789,37 @@ async function tuiShowQuota(force = false) {
   const statusTag = v.subscription?.status
     ? paint(`（${v.subscription.status}）`, PLAN_ACTIVE_STATUSES.has(v.subscription.status) ? ANSI.green : ANSI.yellow)
     : '';
-  out.push(` 套餐：${paint(planName, ANSI.bold)}${statusTag}${v.plan ? paint(`   标称额度 ${formatCredits(v.plan.monthlyCredits)}/月`, ANSI.dim) : ''}`);
+  out.push(` 套餐：${paint(planName, ANSI.bold)}${statusTag}${v.plan ? paint(`   ${formatCredits(v.plan.monthlyCredits)}/月`, ANSI.dim) : ''}`);
 
   if (v.user?.userName || v.user?.name) {
     out.push(` 账号：${v.user.userName || v.user.name}${v.org?.login ? `  ·  组织 ${v.org.login}` : ''}`);
   }
 
-  if (c.hasCreditsInfo) {
-    out.push(` 剩余：${paint(formatCredits(c.totalRemaining), ANSI.bold, ANSI.green)} / 额度池 ${formatCredits(c.totalPool)}`);
-    out.push(` 已用：${formatCredits(c.totalSpent)}  ${progressBar(c.usagePercent)} ${c.usagePercent.toFixed(1)}%`);
-    out.push(paint(
-      `       其中 月度 ${formatCredits(c.monthlyRemaining)} · 加油包 ${formatCredits(c.purchasedRemaining)} · 赠送 ${formatCredits(c.freeRemaining)}`,
-      ANSI.dim,
-    ));
+  // 用量窗口（对齐官方 CLI 的 Usage limits 区块）：5小时 / 每周来自 windowLimits，
+  // 每月由套餐周期额度自己算一条
+  const windowRows = renderWindowLimits(v.windowLimits);
+  const cycleRow = renderCycleMeter(v);
+  if (windowRows.length || cycleRow) {
+    out.push('');
+    out.push(paint(' 用量窗口', ANSI.bold));
+    out.push(...windowRows);
+    if (cycleRow) out.push(cycleRow);
+    if (!windowRows.length) {
+      out.push(paint('   （服务端未返回 5 小时 / 每周窗口，仅显示按周期的月度额度）', ANSI.dim));
+    }
   } else {
     out.push(paint(' ⚠️  服务端没有返回额度数字（可能是新套餐，或该套餐不按额度计费）', ANSI.yellow));
+  }
+
+  if (c.hasCreditsInfo) {
+    out.push('');
+    out.push(` 额度池：剩余 ${paint(formatCredits(c.totalRemaining), ANSI.bold, ANSI.green)} / ${formatCredits(c.totalPool)}`
+      + `   已用 ${formatCredits(c.totalSpent)}`);
+    out.push(paint(
+      `         其中 月度 ${formatCredits(c.monthlyRemaining)} · 加油包 ${formatCredits(c.purchasedRemaining)} · 赠送 ${formatCredits(c.freeRemaining)}`,
+      ANSI.dim,
+    ));
+    if (c.belowThreshold) out.push(paint(` ⚠️  额度已低于告警阈值 ${formatCredits(c.creditThreshold)}`, ANSI.yellow));
   }
 
   if (v.subscription?.currentPeriodEnd) {
@@ -2745,9 +2827,6 @@ async function tuiShowQuota(force = false) {
     const daysTag = days === null ? '' : (days < 3 ? paint(` · 仅剩 ${days} 天`, ANSI.red) : ` · 还剩 ${days} 天`);
     out.push(` 周期：${formatDateTime(v.subscription.currentPeriodStart)} → ${formatDateTime(v.subscription.currentPeriodEnd)}${daysTag}`);
   }
-
-  const windows = formatWindowLimits(v.windowLimits);
-  if (windows.length) out.push('', ...windows);
 
   // 部分接口没拿到时如实列出，不假装数据齐全
   if (r.warnings?.length) {
@@ -2760,10 +2839,10 @@ async function tuiShowQuota(force = false) {
   out.push('');
   if (r.ok) {
     out.push(paint(r.cached
-      ? ` 数据来源: CC 账单接口 · ${age}s 前的缓存（按 [8] 强制刷新）`
-      : ` 数据来源: CC 账单接口 · 刚刚拉取（耗时 ${elapsedS}s）`, ANSI.dim));
+      ? ` 刷新时间：${formatDateTime(r.at)}（${age}s 前的缓存 · 按 [8] 强制刷新）`
+      : ` 刷新时间：${formatDateTime(r.at)}（耗时 ${elapsedS}s · 数据来源 CC 账单接口）`, ANSI.dim));
   } else {
-    out.push(paint(` ⚠️  本次刷新失败（${r.error}），以上为 ${age}s 前的旧数据`, ANSI.yellow));
+    out.push(paint(` ⚠️  本次刷新失败（${r.error}），以上为 ${formatDateTime(r.at)} 的旧数据（${age}s 前）`, ANSI.yellow));
   }
   out.push('');
   tuiWriteAbovePrompt(out.join('\n'));
@@ -3000,13 +3079,7 @@ function startTui() {
   rl.setPrompt(TUI_MAIN_PROMPT);
   rl.prompt();
 
-  // 启动即自动展示一次当前套餐可用模型（命中 5 分钟缓存时不再打接口），
-  // 展示完再把菜单摆回来
-  if (TUI.apiKey) {
-    TUI.queue = TUI.queue
-      .then(() => tuiShowModels(false))
-      .then(() => tuiReprompt());
-  }
+  // 启动只摆菜单，不自动拉取模型列表（避免每次启动刷一屏，需要时按 [1]）
 }
 
 // ── 服务器 ──────────────────────────────────────────

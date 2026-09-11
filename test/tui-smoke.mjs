@@ -22,6 +22,7 @@ const PLAN_MODELS = [
   { id: 'deepseek/deepseek-v4-flash' },
   { id: 'xiaomi/mimo-v2.5', name: 'MiMo V2.5' },
 ];
+const NOW = Date.now(); // 窗口重置时间基于当前时刻，保证"还剩 N 小时"可断言
 const BAD_KEY = 'user_badkey999';
 const NO_QUOTA_KEY = 'user_noquota111';   // 模型能拉、额度接口 401
 const SLOW_KEY = 'user_slowkey222';       // 账单接口挂起不响应 → 验证超时提示
@@ -72,13 +73,21 @@ const mock = http.createServer((req, res) => {
         return;
       }
       if (path === '/alpha/billing/credits') {
+        // 与线上真实返回一致：windowLimits 是顶层字段，和 credits 平级；
+        // 窗口字段是 used/cap，resetAt 是 epoch 毫秒。
         send(200, {
           credits: {
-            planId: 'individual-pro-v1',
-            monthlyCredits: 63.5,
+            belowThreshold: false,
+            creditThreshold: 0,
+            monthlyCredits: 54.5,   // 与下面 totalCost=25.5、套餐 $80 自洽：80 - 25.5
             purchasedCredits: 10,
             freeCredits: 1.5,
-            windowLimits: { fiveHour: { used: 3, limit: 20, resetAt: '2026-09-10T18:00:00Z' } },
+          },
+          windowLimits: {
+            limited: true,
+            exceeded: null,
+            fiveHour: { used: 1.5, cap: 3, exceeded: false, resetAt: NOW + 2 * 3600 * 1000 + 30 * 60 * 1000 },
+            weekly: { used: 4.5, cap: 6, exceeded: false, resetAt: NOW + 26 * 3600 * 1000 },
           },
         });
         return;
@@ -174,11 +183,12 @@ async function main() {
   await new Promise((r) => mock.listen(MOCK_PORT, '127.0.0.1', r));
   console.log(`mock 上游: http://127.0.0.1:${MOCK_PORT}\n`);
 
-  // A. 有效 Key —— 启动即显示当前套餐模型，菜单各项可用，退出干净
-  console.log('场景 A：有效 Key · 启动展示当前套餐可用模型');
+  // A. 有效 Key —— 启动只摆菜单（不自动刷模型），各菜单项可用，退出干净
+  console.log('场景 A：有效 Key · 启动不自动拉模型，按 [1] 才展示');
   const a = await runProxy({
     apiKey: 'user_tuitest123',
     steps: [
+      { waitFor: '请输入序号', send: '1\n' },
       { waitFor: '当前套餐可用模型（共 3 个）', send: '4\n' },
       { waitFor: '服务状态与配置', send: '6\n' },
       { waitFor: '最近日志', send: '0\n' },
@@ -191,6 +201,11 @@ async function main() {
   check(a.out.includes('服务状态与配置') && a.out.includes('已处理请求'), '菜单 [4] 服务状态');
   check(a.out.includes('最近日志'), '菜单 [6] 最近日志');
   check(a.out.includes('请输入序号 >'), '主菜单提示符');
+  // 启动时不应自动拉取模型列表（用户明确要求别每次启动都刷屏）
+  const firstModelAt = a.out.indexOf('当前套餐可用模型（共 3 个）');
+  const firstPromptAt = a.out.indexOf('请输入序号 >');
+  check(firstModelAt > firstPromptAt, '启动只摆菜单，模型列表要按 [1] 才出现（不自动刷屏）');
+  check((a.out.match(/当前套餐可用模型（共 3 个）/g) || []).length === 1, '模型列表只打印了一次（没有启动时那次多余输出）');
   // 输出会滚动追加，菜单必须每次输出完再摆一遍，否则用户得往上翻
   const menuCount = a.out.split(MENU_MARK).length - 1;
   check(menuCount >= 4, `每次输出后重印菜单（全文 ${menuCount} 次：初始 + 模型列表 + 状态 + 日志）`);
@@ -204,6 +219,7 @@ async function main() {
   const b = await runProxy({
     apiKey: BAD_KEY,
     steps: [
+      { waitFor: '请输入序号', send: '1\n' },
       { waitFor: '以下为内置参考列表', send: '2\n' },
       { waitFor: '请按 [5] 设置有效 API Key 后重试。', send: '0\n' },
     ],
@@ -222,24 +238,29 @@ async function main() {
   const b2 = await runProxy({
     apiKey: 'user_tuitest123',
     steps: [
-      { waitFor: '当前套餐可用模型（共 3 个）', send: '3\n' },
-      { waitFor: '数据来源: CC 账单接口', send: '8\n' },   // [8] 强制刷新（跳过 30s 缓存）
+      { waitFor: '请输入序号', send: '3\n' },
+      { waitFor: '刷新时间：', send: '8\n' },   // [8] 强制刷新（跳过 30s 缓存）
       { waitFor: '耗时', send: '0\n' },
     ],
   });
   check(b2.code === 0, '退出码 0', `实际 ${b2.code}\n${tail(b2.out)}`);
   check(b2.out.includes('当前套餐额度'), '显示额度面板标题');
   check(b2.out.includes('套餐：Pro') && b2.out.includes('（active）'), '解析出套餐名 Pro 与 active 状态');
-  check(b2.out.includes('标称额度 $80.00/月'), 'planId individual-pro-v1 → 标称额度 $80/月（长前缀优先）');
-  // 剩余 = 63.5 + 10 + 1.5 = 75.00；额度池 = max(80, 63.5) + 10 + 1.5 = 91.50；已用 = 25.50
-  check(b2.out.includes('剩余：$75.00 / 额度池 $91.50'), '剩余与额度池计算正确（对齐 CLI projectUsageView）');
-  check(b2.out.includes('已用：$25.50'), '本期已花费正确（usage/summary 的 totalCost）');
-  check(b2.out.includes('其中 月度 $63.50 · 加油包 $10.00 · 赠送 $1.50'), '三类额度拆分正确');
-  check(/\[\u2588+\u2591+\] \d+\.\d%/.test(b2.out), '渲染出进度条与百分比');
+  check(b2.out.includes('$80.00/月'), 'planId individual-pro-v1 → 标称额度 $80/月（长前缀优先）');
+  // 用量窗口：windowLimits 在 credits 响应顶层（曾经读错路径导致窗口整个不显示）
+  check(b2.out.includes('用量窗口'), '显示用量窗口区块');
+  check(/5小时\s+\[\u2588+\u2591+\]\s+50%/.test(b2.out), '5小时窗口 1.5/3 → 50% 进度条');
+  check(/每周\s+\[\u2588+\u2591+\]\s+75%/.test(b2.out), '每周窗口 4.5/6 → 75% 进度条');
+  check(/每月\s+\[\u2588+\u2591+\]\s+28%/.test(b2.out), '每月窗口按套餐周期额度算 → 28%');
+  check(b2.out.includes('2小时30分后重置'), '5小时窗口显示距重置的剩余时长');
+  check(b2.out.includes('1天2小时后重置'), '每周窗口显示距重置的剩余时长');
+  check((b2.out.match(/剩余 \$1\.50/g) || []).length >= 2, '两个窗口分别算出剩余额度 $1.50');
+  check(b2.out.includes('额度池：剩余 $66.00 / $91.50'), '额度池与剩余计算正确（对齐 CLI projectUsageView）');
+  check(b2.out.includes('已用 $25.50'), '本期已花费正确（usage/summary 的 totalCost）');
+  check(b2.out.includes('其中 月度 $54.50 · 加油包 $10.00 · 赠送 $1.50'), '三类额度拆分正确');
   check(b2.out.includes('账号：tester') && b2.out.includes('组织 tester-org'), '展示账号与组织');
   check(b2.out.includes('还剩'), '展示周期剩余天数');
-  check(b2.out.includes('限流窗口') && b2.out.includes('fiveHour') && b2.out.includes('用量 3 / 20'), '防御式展示 windowLimits');
-  check(b2.out.includes('数据来源: CC 账单接口'), '标注数据来源');
+  check(/刷新时间：\d{4}\/\d+\/\d+/.test(b2.out), '显示刷新时间（绝对时刻）');
   const quotaPaths = mockRequests.quotaPaths.map((u) => u.split('?')[0]);
   check(quotaPaths.includes('/alpha/whoami'), '先请求 whoami');
   check(quotaPaths.includes('/alpha/billing/credits'), '请求 billing/credits');
@@ -258,7 +279,7 @@ async function main() {
   const c0 = await runProxy({
     apiKey: NO_QUOTA_KEY,
     steps: [
-      { waitFor: '当前套餐可用模型（共 3 个）', send: '3\n' },
+      { waitFor: '请输入序号', send: '3\n' },
       { waitFor: '❌ 读取失败', send: '0\n' },
     ],
   });
@@ -272,7 +293,7 @@ async function main() {
     apiKey: SLOW_KEY,
     env: { CC_QUOTA_TIMEOUT_MS: '1500' },
     steps: [
-      { waitFor: '当前套餐可用模型（共 3 个）', send: '3\n' },
+      { waitFor: '请输入序号', send: '3\n' },
       { waitFor: '❌ 读取失败', send: '0\n' },
     ],
     timeoutMs: 60000,
@@ -288,12 +309,13 @@ async function main() {
   const c3 = await runProxy({
     apiKey: PARTIAL_KEY,
     steps: [
-      { waitFor: '当前套餐可用模型（共 3 个）', send: '3\n' },
+      { waitFor: '请输入序号', send: '3\n' },
       { waitFor: '部分数据未取到', send: '0\n' },
     ],
   });
   check(c3.code === 0, '退出码 0', `实际 ${c3.code}\n${tail(c3.out)}`);
-  check(c3.out.includes('剩余：$75.00'), '余额仍正常展示（核心数据没被拖垮）');
+  check(c3.out.includes('额度池：剩余 $66.00'), '余额仍正常展示（核心数据没被拖垮）');
+  check(c3.out.includes('用量窗口') && c3.out.includes('5小时'), '5小时/每周窗口照常展示（来自 credits 接口）');
   check(c3.out.includes('部分数据未取到') && c3.out.includes('billing/subscriptions'), '如实列出缺失的接口');
   check(!c3.out.includes('周期：'), '缺周期信息时不显示空周期行');
 
@@ -314,7 +336,7 @@ async function main() {
   check(!c.out.includes(typedKey), '❌ 手输的 Key 未回显到终端');
   check(c.out.includes('已启用 API Key user_****'), '显示脱敏后的 Key');
   check(c.out.includes('未写入文件，仅本次运行有效'), '选择 n 后不落盘');
-  check(c.out.includes('当前套餐可用模型（共 3 个）'), '换 Key 后能拉取套餐模型');
+  check(c.out.includes('当前套餐可用模型（共 3 个）'), '换 Key 后按 [1] 能拉取套餐模型');
 
   const configAfter = fs.readFileSync(CONFIG_PATH, 'utf8');
   check(configBefore === configAfter, 'config.json 未被改动（本次测试全程不落盘）');

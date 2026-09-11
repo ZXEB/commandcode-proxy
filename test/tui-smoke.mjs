@@ -23,7 +23,9 @@ const PLAN_MODELS = [
   { id: 'xiaomi/mimo-v2.5', name: 'MiMo V2.5' },
 ];
 const BAD_KEY = 'user_badkey999';
-const NO_QUOTA_KEY = 'user_noquota111'; // 模型能拉、额度接口 401
+const NO_QUOTA_KEY = 'user_noquota111';   // 模型能拉、额度接口 401
+const SLOW_KEY = 'user_slowkey222';       // 账单接口挂起不响应 → 验证超时提示
+const PARTIAL_KEY = 'user_partial333';    // subscriptions 500 → 验证部分失败告警
 const MENU_MARK = '[0] 退出（停止代理）';
 
 // ── Mock 上游 ─────────────────────────────────────────
@@ -60,6 +62,13 @@ const mock = http.createServer((req, res) => {
       const path = req.url.split('?')[0];
       if (path === '/alpha/whoami') {
         send(200, { user: { id: 'u_1', userName: 'tester' }, org: { id: 'org_9', login: 'tester-org' } });
+        return;
+      }
+      // 模拟 CC 账单接口"很慢"：挂起不响应，直到客户端超时
+      if (auth.includes(SLOW_KEY)) return;
+      // 模拟部分接口故障：周期信息拿不到，但额度本身正常
+      if (auth.includes(PARTIAL_KEY) && path === '/alpha/billing/subscriptions') {
+        send(500, { error: { message: 'boom' } });
         return;
       }
       if (path === '/alpha/billing/credits') {
@@ -108,7 +117,7 @@ function tail(s, n = 1500) {
   return t.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').split('\n').map((l) => '      | ' + l).join('\n');
 }
 
-function runProxy({ apiKey, steps, timeoutMs = 30000 }) {
+function runProxy({ apiKey, steps, timeoutMs = 30000, env = {} }) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [path.join(ROOT, 'proxy.mjs')], {
       cwd: ROOT,
@@ -119,6 +128,7 @@ function runProxy({ apiKey, steps, timeoutMs = 30000 }) {
         CC_TUI: 'force',        // 管道下强制启用 TUI（真实 cmd 里靠 isTTY 自动启用）
         CC_TUI_COLOR: '0',
         CC_API_KEY: apiKey || '',
+        ...env,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -213,7 +223,8 @@ async function main() {
     apiKey: 'user_tuitest123',
     steps: [
       { waitFor: '当前套餐可用模型（共 3 个）', send: '3\n' },
-      { waitFor: '数据来源: CC 账单接口', send: '0\n' },
+      { waitFor: '数据来源: CC 账单接口', send: '8\n' },   // [8] 强制刷新（跳过 30s 缓存）
+      { waitFor: '耗时', send: '0\n' },
     ],
   });
   check(b2.code === 0, '退出码 0', `实际 ${b2.code}\n${tail(b2.out)}`);
@@ -236,6 +247,10 @@ async function main() {
   check(quotaPaths.includes('/alpha/usage/summary'), '请求 usage/summary');
   check(mockRequests.quotaPaths.some((u) => u.includes('orgId=org_9')), '带上了 whoami 返回的 orgId');
   check(mockRequests.quotaPaths.some((u) => u.includes('since=2026-09-01')), 'usage/summary 带上了周期起点 since');
+  // 首次发现组织后要把 orgId 记住，后续刷新直接带上（省掉一轮等待）
+  const lastCredits = [...mockRequests.quotaPaths].reverse().find((u) => u.startsWith('/alpha/billing/credits'));
+  check(lastCredits.includes('orgId=org_9'), '第二次刷新直接用上了缓存的 orgId（末次 credits 请求带 orgId）');
+  check(b2.out.includes('耗时'), '展示本次拉取耗时');
   check(!b2.out.includes('user_tuitest123'), '❌ 额度面板未泄露完整 API Key');
 
   // C. 额度接口 401：如实报错，不编数字
@@ -250,6 +265,37 @@ async function main() {
   check(c0.code === 0, '退出码 0', `实际 ${c0.code}\n${tail(c0.out)}`);
   check(c0.out.includes('❌ 读取失败') && c0.out.includes('401'), '提示读取失败并给出 401');
   check(!c0.out.includes('剩余：$'), '❌ 失败时没有编造额度数字');
+
+  // C2. 账单接口挂起 → 超时；必须给出看得懂的提示，且不能永远卡住
+  console.log('\n场景 C2：账单接口不响应 · 超时提示（CC_QUOTA_TIMEOUT_MS=1500）');
+  const c2 = await runProxy({
+    apiKey: SLOW_KEY,
+    env: { CC_QUOTA_TIMEOUT_MS: '1500' },
+    steps: [
+      { waitFor: '当前套餐可用模型（共 3 个）', send: '3\n' },
+      { waitFor: '❌ 读取失败', send: '0\n' },
+    ],
+    timeoutMs: 60000,
+  });
+  check(c2.code === 0, '退出码 0', `实际 ${c2.code}\n${tail(c2.out)}`);
+  check(c2.out.includes('账单接口超时'), '提示是「账单接口超时」而不是英文原文');
+  check(c2.out.includes('/alpha/billing/credits'), '指出是哪个端点超时');
+  check(c2.out.includes('quotaTimeoutMs'), '给出可调大超时的排查建议');
+  check(!c2.out.includes('The operation was aborted'), '❌ 不再把 undici 英文原文丢给用户');
+
+  // C3. 部分接口故障：额度照常显示，缺的那块如实告警
+  console.log('\n场景 C3：subscriptions 故障 · 部分数据缺失如实告警');
+  const c3 = await runProxy({
+    apiKey: PARTIAL_KEY,
+    steps: [
+      { waitFor: '当前套餐可用模型（共 3 个）', send: '3\n' },
+      { waitFor: '部分数据未取到', send: '0\n' },
+    ],
+  });
+  check(c3.code === 0, '退出码 0', `实际 ${c3.code}\n${tail(c3.out)}`);
+  check(c3.out.includes('剩余：$75.00'), '余额仍正常展示（核心数据没被拖垮）');
+  check(c3.out.includes('部分数据未取到') && c3.out.includes('billing/subscriptions'), '如实列出缺失的接口');
+  check(!c3.out.includes('周期：'), '缺周期信息时不显示空周期行');
 
   // D. 菜单 [5] 手动输入 Key —— 不回显、不落盘
   console.log('\n场景 D：菜单 [5] 手输 Key · 回显屏蔽 + 选择不写盘');
@@ -302,6 +348,7 @@ async function main() {
   const restored = fs.existsSync(LOCAL_CONFIG_PATH) ? fs.readFileSync(LOCAL_CONFIG_PATH, 'utf8') : null;
   check(restored === localBefore, localBefore === null ? '测试已清理 config.local.json' : '已还原用户原有的 config.local.json');
 
+  await new Promise((r) => { try { mock.closeAllConnections?.(); } catch {} r(); });
   await new Promise((r) => mock.close(r));
   console.log(failures === 0 ? '\n全部通过 ✅' : `\n失败 ${failures} 项 ❌`);
   process.exit(failures === 0 ? 0 : 1);

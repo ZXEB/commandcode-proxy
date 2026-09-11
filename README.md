@@ -73,6 +73,7 @@ commandcode/
  [5] 设置 / 更换 API Key
  [6] 查看最近日志
  [7] 清屏
+ [8] 强制刷新额度（跳过缓存）
  [0] 退出（停止代理）
 请输入序号 >
 ```
@@ -81,11 +82,12 @@ commandcode/
 |-----|--------|
 | `1` | List the models **your plan** can use (`GET {apiBase}/provider/v1/models`, scoped to your key) with index, model ID and note |
 | `2` | Force a re-fetch, bypassing the 5-minute cache |
-| `3` | Show **your plan quota**: plan name / subscription status / credits remaining / credit pool / spent this period with a progress bar / billing period and days left. Quota changes slowly, so a second press within a minute serves the cache — press again to force a refresh |
+| `3` | Show **your plan quota**: plan name / subscription status / credits remaining / credit pool / spent this period with a progress bar / billing period and days left. Serves a 30-second cache; use `[8]` to force a refresh |
 | `4` | Listen address, uptime, upstream API, model source & cache, request counters |
 | `5` | Set / change the API key (no echo; optionally saved to the project's `config.local.json`) |
 | `6` | Last 40 log lines (in-memory ring buffer, max 300, never written to disk) |
 | `7` | Clear screen |
+| `8` | Force-refresh the quota, bypassing the 30-second cache |
 | `0` | Exit and stop the proxy (`q` / `exit` also work); press Ctrl+C twice |
 
 **What `[3]` looks like:**
@@ -99,7 +101,7 @@ commandcode/
        其中 月度 $5.04 · 加油包 $0.00 · 赠送 $0.00
  周期：2026/8/25 14:03:54 → 2026/9/25 14:03:54 · 还剩 15 天
 
- 数据来源: CC 账单接口 · 刚刚拉取
+ 数据来源: CC 账单接口 · 刚刚拉取（耗时 4s）
 ```
 
 Quota comes from Command Code's own billing endpoints — the same ones the official CLI's `/usage` panel uses (`/alpha/whoami`, `/alpha/billing/credits`, `/alpha/billing/subscriptions`, `/alpha/usage/summary`). They are read-only GETs and consume no credits. The math matches the CLI's `projectUsageView`:
@@ -108,7 +110,13 @@ Quota comes from Command Code's own billing endpoints — the same ones the offi
 - **credit pool** = when the subscription is active, `max(plan's nominal credits, monthly remaining)` + purchased + free; otherwise spent + remaining;
 - **spent** = `totalCost` since the start of the current billing period.
 
-When the data cannot be fetched it reports the error honestly (e.g. 401 for an invalid key) and **never invents numbers**; if a refresh fails while older data is cached, the panel labels it explicitly as stale. Any `windowLimits` rate-limit windows returned by the server are listed too.
+**On latency**: these billing endpoints are simply slow (measured: `whoami` 7–17s, `subscriptions` up to 20s+, `summary` ~8s — while DNS takes 2ms, so the slowness is server-side, not your network). Therefore:
+
+- requests now run **in parallel** (they used to be sequential, measured at 47s worst case), so total time is bounded by the slowest single call;
+- the per-request timeout is a generous **45 seconds**, tunable via `quotaTimeoutMs` in `config.json` or the `CC_QUOTA_TIMEOUT_MS` env var;
+- while waiting, a progress line is printed every 5 seconds (`仍在读取（已等待 Ns）`) so it never looks hung;
+- `orgId` is remembered after the first lookup, saving a round trip on later refreshes;
+- when data can't be fetched it reports the error honestly with a concrete hint (a timeout names the endpoint and points at `quotaTimeoutMs`) and **never invents numbers**; if one endpoint fails alone, the rest is still shown and the missing piece is listed under `部分数据未取到`; when a refresh fails while older data is cached, the panel explicitly labels it as stale. Any `windowLimits` rate-limit windows returned by the server are listed too.
 
 Notes:
 
@@ -143,6 +151,7 @@ Notes:
 | `logLevel` | `info` | Log level |
 | `useProviderModels` | `true` | Dynamically fetch model list from Provider API |
 | `modelRefreshIntervalMs` | `300000` | Model list cache refresh interval (5 min) |
+| `quotaTimeoutMs` | `45000` | Per-request timeout for billing endpoints (measured 8–20s — don't set it too low) |
 
 An optional `config.local.json` may also be present: same fields as `config.json`, but it **takes precedence** (`config.json` is read first, then overridden by this file). The API key saved by console menu `[4]` lands here; the file is excluded via `.gitignore` / `.dockerignore`, so it is never committed or baked into an image.
 
@@ -158,6 +167,7 @@ An optional `config.local.json` may also be present: same fields as `config.json
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
 | `CC_TUI` | Force the interactive console on/off (see above) |
 | `CC_API_KEY` | API key used by the console (not used for request-side auth) |
+| `CC_QUOTA_TIMEOUT_MS` | Billing endpoint timeout (same as `quotaTimeoutMs`) |
 
 ## API Endpoints
 

@@ -23,6 +23,7 @@ function loadConfig() {
     logLevel: 'info',
     useProviderModels: true,
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
+    quotaTimeoutMs: 45000,                   // CC 账单接口实测 8~20s，超时给足
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -2233,8 +2234,12 @@ function getPlanInfo(planId) {
   return { name: PLAN_DISPLAY_NAMES[key] ?? key, monthlyCredits: PLAN_MONTHLY_CREDITS[key] };
 }
 
-let quotaCache = null;            // { at, view, raw }
-const QUOTA_CACHE_MS = 60 * 1000; // 额度变化慢，1 分钟内重复查看直接复用
+let quotaCache = null;              // { at, view, raw }
+const QUOTA_CACHE_MS = 30 * 1000;   // 连按 [3] 不必等两遍；[8] 可强制刷新
+// 实测 CC 账单接口很慢：whoami 7~17s、subscriptions 最高 20s+、summary ~8s（DNS 仅 2ms，
+// 慢在服务端）。超时给足，否则必然误报"读取失败"。
+const QUOTA_TIMEOUT_MS = parseInt(process.env.CC_QUOTA_TIMEOUT_MS || '') || CFG.quotaTimeoutMs || 45000;
+const quotaOrgIds = new Map();      // apiKey → orgId|null（避免每次都先等 whoami 才知道 orgId）
 
 function quotaHeaders(apiKey) {
   return {
@@ -2247,14 +2252,29 @@ function quotaHeaders(apiKey) {
 }
 
 async function quotaGet(apiKey, endpoint) {
-  const response = await fetch(`${CFG.apiBase}${endpoint}`, {
-    headers: quotaHeaders(apiKey),
-    signal: AbortSignal.timeout(10000),
-  });
+  const started = Date.now();
+  let response;
+  try {
+    response = await fetch(`${CFG.apiBase}${endpoint}`, {
+      headers: quotaHeaders(apiKey),
+      signal: AbortSignal.timeout(QUOTA_TIMEOUT_MS),
+    });
+  } catch (e) {
+    // AbortSignal.timeout 抛的是 TimeoutError，原文是英文的 "operation was aborted..."，
+    // 这里换成看得懂的说明（并带上端点与耗时，便于判断是服务端慢还是网络不通）
+    if (e?.name === 'TimeoutError' || e?.name === 'AbortError') {
+      const err = new Error(`账单接口超时（${Math.round((Date.now() - started) / 1000)}s 无响应）：${endpoint.split('?')[0]}`);
+      err.timeout = true;
+      throw err;
+    }
+    const err = new Error(`无法连接 CC 服务端：${e.message}`);
+    err.network = true;
+    throw err;
+  }
   if (!response.ok) {
     const err = new Error(response.status === 401
       ? 'API Key 无效或已过期（HTTP 401）'
-      : `额度接口返回 HTTP ${response.status}`);
+      : `账单接口返回 HTTP ${response.status}：${endpoint.split('?')[0]}`);
     err.status = response.status;
     throw err;
   }
@@ -2313,33 +2333,72 @@ async function fetchQuota(apiKey, opts = {}) {
 async function doFetchQuota(apiKey, { force = false } = {}) {
   const now = Date.now();
   if (!force && quotaCache && (now - quotaCache.at) < QUOTA_CACHE_MS) {
-    return { ok: true, view: quotaCache.view, raw: quotaCache.raw, at: quotaCache.at, cached: true };
+    return { ok: true, view: quotaCache.view, raw: quotaCache.raw, at: quotaCache.at, cached: true, warnings: [] };
   }
 
   try {
     if (!apiKey) throw new Error('未提供 API Key');
 
-    const whoami = await quotaGet(apiKey, '/alpha/whoami');
-    const orgId = whoami?.org?.id ?? null;
-    const orgQs = orgId ? `?orgId=${encodeURIComponent(orgId)}` : '';
+    const warnings = [];
+    let creditsError = null;
+    const settle = (r, label) => {
+      if (r.status === 'fulfilled') return r.value;
+      if (label === 'billing/credits') creditsError = r.reason;
+      warnings.push(`${label}：${r.reason?.message ?? '获取失败'}`);
+      return null;
+    };
 
-    const [credits, subscription] = await Promise.all([
-      quotaGet(apiKey, `/alpha/billing/credits${orgQs}`),
-      quotaGet(apiKey, `/alpha/billing/subscriptions${orgQs}`),
-    ]);
+    // orgId 已知（含"确认没有组织"）就直接带上，省掉一轮等待
+    let orgId = quotaOrgIds.has(apiKey) ? quotaOrgIds.get(apiKey) : null;
+    const withOrg = (endpoint, id) => `${endpoint}${id ? `?orgId=${encodeURIComponent(id)}` : ''}`;
 
-    // 本周期起点 → 本期已花费；没有周期起点就不带 since（让服务端用默认窗口）
-    const since = subscription?.data?.currentPeriodStart ?? null;
-    const summaryParams = new URLSearchParams();
-    if (orgId) summaryParams.set('orgId', orgId);
-    if (since) summaryParams.set('since', since);
-    const summaryQs = summaryParams.toString();
+    // 三个接口并行。以前是串行（whoami → 其余 → summary），实测串行要 47s；
+    // 并行后总耗时只取决于最慢的那个（~20s）。
+    let [whoami, credits, subscription] = (await Promise.allSettled([
+      quotaGet(apiKey, '/alpha/whoami'),
+      quotaGet(apiKey, withOrg('/alpha/billing/credits', orgId)),
+      quotaGet(apiKey, withOrg('/alpha/billing/subscriptions', orgId)),
+    ])).map((r, i) => settle(r, ['whoami', 'billing/credits', 'billing/subscriptions'][i]));
+
+    // 额度数据是面板的核心：拿不到才算失败。服务端偶发慢/抖动时重试一次；
+    // 明确是 401 之类的错误则不重试，直接如实抛出。
+    if (!credits) {
+      if (!creditsError || !creditsError.status) {
+        const retry = await Promise.allSettled([quotaGet(apiKey, withOrg('/alpha/billing/credits', orgId))]);
+        if (retry[0].status === 'fulfilled') credits = retry[0].value;
+        else throw retry[0].reason;
+      } else {
+        throw creditsError;
+      }
+      const idx = warnings.findIndex((w) => w.startsWith('billing/credits'));
+      if (idx >= 0) warnings.splice(idx, 1); // 重试成功，撤掉这条告警
+    }
+
+    // whoami 只影响 orgId 与账号显示；首次发现组织时，用 orgId 再取一次账单
+    const realOrgId = whoami?.org?.id ?? null;
+    if (!quotaOrgIds.has(apiKey)) {
+      quotaOrgIds.set(apiKey, realOrgId);
+      if (realOrgId && realOrgId !== orgId) {
+        orgId = realOrgId;
+        const refetched = await Promise.allSettled([
+          quotaGet(apiKey, withOrg('/alpha/billing/credits', orgId)),
+          quotaGet(apiKey, withOrg('/alpha/billing/subscriptions', orgId)),
+        ]);
+        credits = settle(refetched[0], 'billing/credits(org)') ?? credits;
+        subscription = settle(refetched[1], 'billing/subscriptions(org)') ?? subscription;
+      }
+    }
+
+    // 本期已花费：依赖 subscriptions 的周期起点，所以放在并行组之后
     let summary = null;
     try {
-      summary = await quotaGet(apiKey, `/alpha/usage/summary${summaryQs ? `?${summaryQs}` : ''}`);
+      const summaryParams = new URLSearchParams();
+      if (orgId) summaryParams.set('orgId', orgId);
+      if (subscription?.data?.currentPeriodStart) summaryParams.set('since', subscription.data.currentPeriodStart);
+      const qs = summaryParams.toString();
+      summary = await quotaGet(apiKey, `/alpha/usage/summary${qs ? `?${qs}` : ''}`);
     } catch (e) {
-      // 已花费拿不到不该让整个额度面板失败，其余字段照常展示
-      log('warn', 'Usage summary fetch failed', { error: e.message });
+      warnings.push(`usage/summary：${e.message}`);
     }
 
     const raw = { whoami, credits, subscription, summary };
@@ -2349,13 +2408,16 @@ async function doFetchQuota(apiKey, { force = false } = {}) {
       plan: view.plan?.name ?? subscription?.data?.planId ?? 'unknown',
       remaining: view.credits.totalRemaining,
       spent: view.credits.totalSpent,
+      elapsedMs: Date.now() - now,
+      warnings: warnings.length,
     });
-    return { ok: true, view, raw, at: now, cached: false };
+    return { ok: true, view, raw, at: now, cached: false, warnings };
   } catch (e) {
-    log('warn', 'Quota fetch failed', { error: e.message });
+    log('warn', 'Quota fetch failed', { error: e.message, elapsedMs: Date.now() - now });
     return {
       ok: false,
       error: e.message,
+      timeout: !!e.timeout,
       view: quotaCache?.view ?? null,
       raw: quotaCache?.raw ?? null,
       at: quotaCache?.at ?? null,
@@ -2523,11 +2585,12 @@ function tuiMenu() {
     ` ${n(5)} 设置 / 更换 API Key`,
     ` ${n(6)} 查看最近日志`,
     ` ${n(7)} 清屏`,
+    ` ${n(8)} 强制刷新额度（跳过缓存）`,
     ` ${n(0)} 退出（停止代理）`,
   ].join('\n');
 }
 
-const TUI_MENU_HINT = '请输入 0-7';
+const TUI_MENU_HINT = '请输入 0-8';
 
 function tuiAsk(promptText) {
   return new Promise((resolve) => {
@@ -2620,14 +2683,34 @@ async function tuiShowQuota(force = false) {
     tuiWriteAbovePrompt(paint('⚠️  还没有 API Key —— 请先按 [5] 设置（Key 必须以 user_ 开头）', ANSI.yellow));
     return;
   }
-  tuiWriteAbovePrompt(paint(force ? '正在重新读取当前套餐额度…' : '正在读取当前套餐额度…', ANSI.dim));
 
-  const r = await fetchQuota(TUI.apiKey, { force });
+  // CC 账单接口很慢（实测 8~20 秒），等待期间每 5 秒报一次进度，免得看起来像卡死
+  const startedAt = Date.now();
+  tuiWriteAbovePrompt(paint(force ? '正在重新读取当前套餐额度…（账单接口较慢，通常 10~30 秒）' : '正在读取当前套餐额度…（账单接口较慢，通常 10~30 秒）', ANSI.dim));
+  const ticker = setInterval(() => {
+    const s = Math.round((Date.now() - startedAt) / 1000);
+    tuiWriteAbovePrompt(paint(`…仍在读取套餐额度（已等待 ${s}s）`, ANSI.dim));
+  }, 5000);
+  ticker.unref?.();
+
+  let r;
+  try {
+    r = await fetchQuota(TUI.apiKey, { force });
+  } finally {
+    clearInterval(ticker);
+  }
+  const elapsedS = Math.round((Date.now() - startedAt) / 1000);
+
   const out = ['', paint('当前套餐额度', ANSI.bold, ANSI.cyan)];
 
   if (!r.ok && !r.view) {
     out.push(paint(` ❌ 读取失败：${r.error}`, ANSI.red));
-    out.push(paint('    额度由 CC 服务端提供，需要有效 API Key；若提示 401 请到 CC 重新复制一把。', ANSI.dim));
+    if (r.timeout) {
+      out.push(paint(`    CC 账单接口 ${elapsedS}s 内没有响应。实测这几个接口本身就要 8~20 秒，`, ANSI.dim));
+      out.push(paint('    若经常超时可在 config.json 调大 quotaTimeoutMs（默认 45000），或换个网络再试。', ANSI.dim));
+    } else {
+      out.push(paint('    额度由 CC 服务端提供，需要有效 API Key；若提示 401 请到 CC 重新复制一把。', ANSI.dim));
+    }
     out.push('');
     tuiWriteAbovePrompt(out.join('\n'));
     return;
@@ -2666,17 +2749,29 @@ async function tuiShowQuota(force = false) {
   const windows = formatWindowLimits(v.windowLimits);
   if (windows.length) out.push('', ...windows);
 
+  // 部分接口没拿到时如实列出，不假装数据齐全
+  if (r.warnings?.length) {
+    out.push('');
+    out.push(paint(' ⚠️  部分数据未取到：', ANSI.yellow));
+    for (const w of r.warnings) out.push(paint(`    · ${w}`, ANSI.yellow));
+  }
+
   const age = r.at ? Math.round((Date.now() - r.at) / 1000) : null;
   out.push('');
   if (r.ok) {
     out.push(paint(r.cached
-      ? ` 数据来源: CC 账单接口 · ${age}s 前的缓存（再按一次 [3] 强制刷新）`
-      : ' 数据来源: CC 账单接口 · 刚刚拉取', ANSI.dim));
+      ? ` 数据来源: CC 账单接口 · ${age}s 前的缓存（按 [8] 强制刷新）`
+      : ` 数据来源: CC 账单接口 · 刚刚拉取（耗时 ${elapsedS}s）`, ANSI.dim));
   } else {
     out.push(paint(` ⚠️  本次刷新失败（${r.error}），以上为 ${age}s 前的旧数据`, ANSI.yellow));
   }
   out.push('');
   tuiWriteAbovePrompt(out.join('\n'));
+}
+
+// [8] 强制刷新额度（跳过 30 秒缓存）
+async function tuiRefreshQuota() {
+  await tuiShowQuota(true);
 }
 
 // [4] 服务状态与配置
@@ -2824,11 +2919,12 @@ async function tuiHandleLine(raw) {
   switch (line) {
     case '1': await tuiShowModels(false); break;
     case '2': await tuiShowModels(true); break;
-    case '3': await tuiShowQuota(true); break;
+    case '3': await tuiShowQuota(false); break;
     case '4': tuiShowStatus(); break;
     case '5': await tuiSetApiKey(); break;
     case '6': tuiShowLogs(); break;
     case '7': tuiClearScreen(); return; // 已重绘菜单 + 提示符，不再重复
+    case '8': await tuiRefreshQuota(); break;
     case '0':
     case 'q':
     case 'Q':

@@ -532,15 +532,33 @@ function mediaKindOfPart(part) {
 
 // 转换 messages 为 CC 格式（OpenAI chat 消息 → CC messages）
 // 注意：返回值可能比输入多（tool 消息夹带媒体时会追加一条 user 消息）。
+//
+// ⚠️ 上游要求：同一个 assistant 发起的**所有** tool 结果必须连续紧跟其后，中间不能插入
+// 别的消息。实测把承载媒体的 user 消息插在 tool 结果之间会被判为结果缺失：
+//   Tool results are missing for tool calls call_B, call_C.
+// 所以这里的做法是：先把媒体**暂存**，等这一串 tool 结果全部落完之后再统一追加一条
+// user 消息（见 flushPendingMedia）。
 function buildCcMessages(chatMessages, toolNameMap) {
   const out = [];
+  const pendingMedia = [];
+  const flushPendingMedia = () => {
+    if (!pendingMedia.length) return;
+    out.push({ role: 'user', content: [{ type: 'text', text: TOOL_MEDIA_NOTE }, ...pendingMedia] });
+    pendingMedia.length = 0;
+  };
+
   for (const msg of chatMessages) {
-    buildCcMessage(msg, toolNameMap, out);
+    // tool 结果必须连续排列；遇到非 tool 消息前先把暂存的媒体补上
+    if (msg.role !== 'tool') flushPendingMedia();
+    buildCcMessage(msg, toolNameMap, out, pendingMedia);
   }
+  flushPendingMedia();
   return out;
 }
 
-function buildCcMessage(msg, toolNameMap, out) {
+const TOOL_MEDIA_NOTE = '以下是工具返回的媒体内容：';
+
+function buildCcMessage(msg, toolNameMap, out, pendingMedia) {
   if (msg.role === 'user') {
     if (typeof msg.content === 'string') {
       out.push({ role: 'user', content: [{ type: 'text', text: msg.content }] });
@@ -600,9 +618,12 @@ function buildCcMessage(msg, toolNameMap, out) {
         .map(c => c.text || '')
         .join('');
       for (const c of msg.content) {
-        if (c && (c.type === 'image_url' || c.type === 'video_url' || c.type === 'audio_url')) mediaParts.push(c);
-        else if (c && (c.type === 'image' || c.type === 'video' || c.type === 'audio' || c.type === 'document')) {
-          mediaParts.push(anthropicMediaToOpenAI(c));
+        if (!c) continue;
+        // 保留原始媒体块，不要在这里预先转成 text ——
+        // 转成 text 会丢掉 MIME，后面就无法判断它其实是视频（只能笼统说"该媒体"）。
+        if (c.type === 'image_url' || c.type === 'video_url' || c.type === 'audio_url'
+          || c.type === 'image' || c.type === 'video' || c.type === 'audio' || c.type === 'document') {
+          mediaParts.push(c);
         }
       }
     } else {
@@ -618,17 +639,15 @@ function buildCcMessage(msg, toolNameMap, out) {
     out.push({ role: 'tool', content: [toolResult] });
     if (mediaParts.length === 0) return;
 
-    // ⚠️ 媒体**不能**塞进 role:'tool' 消息里 —— 上游只允许 tool 消息含 tool-result，
-    // 混入 image part 会被拒：Invalid option: expected one of "user"|"assistant"
-    // at "params.messages[N].role"（实测）。正确做法是另起一条 user 消息承载媒体。
-    const mediaOut = [];
+    // ⚠️ 媒体**不能**塞进 role:'tool' 消息里（上游只允许 tool 消息含 tool-result，混入
+    // image part 会被拒：Invalid option: expected one of "user"|"assistant" ...）；
+    // 也**不能**立刻另起 user 消息插进来 —— 那会打断同一 assistant 的 tool 结果序列，
+    // 被判为结果缺失：Tool results are missing for tool calls ...（实测）。
+    // 正确做法：先把媒体暂存，等这一串 tool 结果全部落完再统一追加（见 buildCcMessages）。
     for (const mp of mediaParts) {
       const img = toCcImagePart(mp);
-      if (img) mediaOut.push(img);
-      else mediaOut.push({ type: 'text', text: unsupportedMediaText(mediaKindOfPart(mp), '') });
-    }
-    if (mediaOut.length) {
-      out.push({ role: 'user', content: [{ type: 'text', text: '以下是工具返回的媒体内容：' }, ...mediaOut] });
+      if (img) pendingMedia.push(img);
+      else pendingMedia.push({ type: 'text', text: unsupportedMediaText(mediaKindOfPart(mp), '') });
     }
     return;
   }
@@ -1443,7 +1462,9 @@ function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage,
 //   { type:'video' | 'audio' | 'document', ... }
 // CC 只支持 text 与 image 两种 part，非图片一律降级成文本说明（不伪造类型、不静默丢弃）。
 function anthropicMediaToOpenAI(block) {
-  const kind = block?.type;                       // image | video | audio | document
+  // 真实类型优先看 MIME：Anthropic 常用 { type:'image', source:{ media_type:'video/mp4' } }
+  // 这种「类型写 image、MIME 是 video」的形态，只看 block.type 会得出错误结论。
+  const kind = mediaKindOfPart(block) || block?.type;
   const img = toCcImagePart(block);
   if (img) return img;
   const src = block?.source || {};
@@ -1538,32 +1559,21 @@ function convertAnthropicToOpenAI(anthropicReq) {
           text = String(tr.content || '');
         }
 
-        if (media.length > 0) {
-          // tool 消息本体只放文本结果；媒体另起一条 user 消息。
-          // （上游不允许 role:'tool' 里混入 image part，否则
-          //   Invalid option: expected one of "user"|"assistant" at ...role）
-          openaiMessages.push({
-            role: 'tool',
-            tool_call_id: tr.tool_use_id,
-            name: toolNameFromId[tr.tool_use_id] || '',
-            content: text || `[tool result attached ${media.length} media file(s)]`,
-          });
-          const mediaParts = [{ type: 'text', text: '以下是工具返回的媒体内容：' }];
-          for (const m of media) {
-            const img = toCcImagePart(m);
-            if (img) mediaParts.push(img);
-            else mediaParts.push({ type: 'text', text: unsupportedMediaText(mediaKindOfPart(m), '') });
-          }
-          // 作为数组 content 交给 buildCcMessages 转换
-          openaiMessages.push({ role: 'user', content: mediaParts });
-        } else {
-          openaiMessages.push({
-            role: 'tool',
-            tool_call_id: tr.tool_use_id,
-            name: toolNameFromId[tr.tool_use_id] || '',
-            content: text,
-          });
-        }
+        // 媒体随 tool 消息一起交给 buildCcMessages —— 它会先落 tool-result，
+        // 再把媒体暂存、等这一串 tool 结果全部结束后统一追加一条 user 消息。
+        // （不能在这里直接插 user 消息：会打断同一 assistant 的 tool 结果序列，
+        //   上游会报 Tool results are missing for tool calls ...）
+        openaiMessages.push({
+          role: 'tool',
+          tool_call_id: tr.tool_use_id,
+          name: toolNameFromId[tr.tool_use_id] || '',
+          content: media.length > 0
+            ? [
+              { type: 'text', text: text || `[tool result attached ${media.length} media file(s)]` },
+              ...media,   // 原始 Anthropic 媒体块，由 buildCcMessages → toCcImagePart 转换
+            ]
+            : text,
+        });
       }
       // 有媒体块时用数组 content（OpenAI 多模态格式），供 buildCcMessages 转换
       if (mediaBlocks.length > 0) {

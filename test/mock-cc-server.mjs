@@ -61,20 +61,48 @@ async function sendScenario(res, model, parsed) {
     await delay(1500);
     await writeChunk(ndjson([{ type: 'text-delta', text: 'late-hello' }, ...okEvents().slice(2)]));
   } else if (model === 'scn-strict-tools') {
-    // 模拟真实 CC 的严格校验：assistant 的每个 tool-call 必须有对应 tool-result
-    const calls = [];
-    const results = new Set();
-    for (const m of parsed?.params?.messages || []) {
-      if (m.role === 'assistant' && Array.isArray(m.content)) {
-        for (const p of m.content) if (p.type === 'tool-call' && p.toolCallId) calls.push(p.toolCallId);
+    // 模拟真实 CC 的严格校验（两条都是实测踩过的约束）：
+    //  1. role:'tool' 消息里不能出现非 tool-result 的 part
+    //  2. 同一 assistant 的 tool 结果必须**连续**紧跟其后 —— 中间插入 user 消息
+    //     会被判为结果缺失（真实报错见下方 missing 文案）
+    const msgs = parsed?.params?.messages || [];
+    let err = null;
+
+    for (const [i, m] of msgs.entries()) {
+      if (!['user', 'assistant', 'tool'].includes(m.role)) {
+        err = `Invalid option: expected one of "user"|"assistant" at "params.messages[${i}].role"`;
+        break;
       }
       if (m.role === 'tool' && Array.isArray(m.content)) {
-        for (const p of m.content) if (p.type === 'tool-result' && p.toolCallId) results.add(p.toolCallId);
+        const bad = m.content.find((p) => p.type !== 'tool-result');
+        if (bad) {
+          err = `Invalid option: expected one of "user"|"assistant" at "params.messages[${i}].role"`;
+          break;
+        }
       }
     }
-    const missing = calls.filter((id) => !results.has(id));
-    if (missing.length > 0) {
-      await writeChunk(JSON.stringify({ type: 'start' }) + '\n' + JSON.stringify({ type: 'error', error: { message: `Tool result is missing for tool call ${missing[0]}.` } }) + '\n');
+
+    if (!err) {
+      for (let i = 0; i < msgs.length && !err; i++) {
+        const m = msgs[i];
+        if (m.role !== 'assistant' || !Array.isArray(m.content)) continue;
+        const calls = m.content.filter((p) => p.type === 'tool-call' && p.toolCallId).map((p) => p.toolCallId);
+        if (!calls.length) continue;
+        const got = new Set();
+        for (let j = i + 1; j < msgs.length; j++) {
+          const nxt = msgs[j];
+          if (nxt.role !== 'tool') break;    // 连续性被打断
+          for (const p of (Array.isArray(nxt.content) ? nxt.content : [])) {
+            if (p.type === 'tool-result' && p.toolCallId) got.add(p.toolCallId);
+          }
+        }
+        const missing = calls.filter((id) => !got.has(id));
+        if (missing.length) err = `Tool results are missing for tool calls ${missing.join(', ')}.`;
+      }
+    }
+
+    if (err) {
+      await writeChunk(JSON.stringify({ type: 'start' }) + '\n' + JSON.stringify({ type: 'error', error: { message: err } }) + '\n');
     } else {
       await writeChunk(ndjson(okEvents()));
     }
@@ -288,6 +316,47 @@ await test('scn-strict-tools：孤儿 tool_use 重放 → 代理合成 tool resu
   check('含完整回复', text.includes('hello') && text.includes(' world'));
   check('mock 只收到 1 次上游请求（首次即合法）', reqCounts['scn-strict-tools'] === 1, `got ${reqCounts['scn-strict-tools']}`);
   check('代理记录了修补日志', proxyLogs.join('').includes('Repaired tool call sequence'));
+});
+
+await test('并行 tool calls + 其中一个结果带媒体 → 结果必须连续、媒体排在其后', async () => {
+  // 复现用户报错：assistant 一次发起 3 个 tool call，第 1 个结果带图片。
+  // 曾经把承载媒体的 user 消息插在 tool 结果之间，导致：
+  //   Tool results are missing for tool calls call_B, call_C.
+  upstreamBodies.length = 0;
+  const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  const { status, text } = await callOpenAI('scn-strict-tools', [
+    { role: 'user', content: '并行读三样' },
+    { role: 'assistant', content: '', tool_calls: [
+      { id: 'call_A', type: 'function', function: { name: 'Read', arguments: '{"file_path":"a.png"}' } },
+      { id: 'call_B', type: 'function', function: { name: 'Read', arguments: '{"file_path":"b.txt"}' } },
+      { id: 'call_C', type: 'function', function: { name: 'Read', arguments: '{"file_path":"c.txt"}' } },
+    ] },
+    { role: 'tool', tool_call_id: 'call_A', name: 'Read', content: [
+      { type: 'text', text: '读到了图片' },
+      { type: 'image_url', image_url: { url: `data:image/png;base64,${PNG}` } },
+    ] },
+    { role: 'tool', tool_call_id: 'call_B', name: 'Read', content: 'b ok' },
+    { role: 'tool', tool_call_id: 'call_C', name: 'Read', content: 'c ok' },
+    { role: 'user', content: '总结' },
+  ]);
+  check('HTTP 200', status === 200);
+  check('上游未报 tool 结果缺失（消息顺序正确）',
+    !/Tool results are missing/i.test(text), text.slice(0, 300));
+
+  const msgs = upstreamBodies.at(-1)?.params?.messages || [];
+  const roles = msgs.map((m) => m.role);
+  // 三个 tool 结果必须连续
+  const firstTool = roles.indexOf('tool');
+  const toolRun = roles.slice(firstTool).filter((r) => r === 'tool').length;
+  check('三条 tool 结果连续排列（中间无 user 插入）',
+    roles.slice(firstTool, firstTool + 3).every((r) => r === 'tool'), JSON.stringify(roles));
+  check('tool 结果数量正确', toolRun === 3, JSON.stringify(roles));
+  // 媒体必须在 tool 结果之后
+  const imgIdx = msgs.findIndex((m) => Array.isArray(m.content) && m.content.some((p) => p.type === 'image'));
+  check('媒体排在所有 tool 结果之后', imgIdx > firstTool + 2, `imgIdx=${imgIdx} roles=${JSON.stringify(roles)}`);
+  check('tool 消息里不含 image part',
+    msgs.filter((m) => m.role === 'tool').every((m) => (m.content || []).every((p) => p.type === 'tool-result')),
+    JSON.stringify(msgs.filter((m) => m.role === 'tool')));
 });
 
 await test('scn-strict-tools：正常 tool_use/tool_result 配对不受影响', async () => {

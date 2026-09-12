@@ -531,95 +531,108 @@ function mediaKindOfPart(part) {
 }
 
 // 转换 messages 为 CC 格式（OpenAI chat 消息 → CC messages）
+// 注意：返回值可能比输入多（tool 消息夹带媒体时会追加一条 user 消息）。
 function buildCcMessages(chatMessages, toolNameMap) {
-  return chatMessages.map(msg => {
-    if (msg.role === 'user') {
-      if (typeof msg.content === 'string') {
-        return { role: 'user', content: [{ type: 'text', text: msg.content }] };
-      }
-      if (Array.isArray(msg.content)) {
-        const parts = [];
-        for (const part of msg.content) {
-          if (part && part.type === 'text') { parts.push(part); continue; }
-          const img = toCcImagePart(part);
-          if (img) { parts.push(img); continue; }
-          // 走到这里：非文本且无法当图片转（视频/音频/远程 URL/未知类型）
-          const url = part?.image_url?.url || part?.video_url?.url || part?.audio_url?.url || part?.source?.url || '';
-          const kind = mediaKindOfPart(part);
-          const isRemote = url && !parseDataUri(url);
-          parts.push({ type: 'text', text: unsupportedMediaText(kind, isRemote ? '远程 URL，CC 只接受 base64 内联图片' : '') });
-          log('warn', 'Unsupported media part downgraded to text', { partType: part?.type, mediaKind: kind, remote: !!isRemote });
-        }
-        return { role: 'user', content: parts };
-      }
-      return { role: 'user', content: [{ type: 'text', text: String(msg.content) }] };
-    }
-    if (msg.role === 'assistant') {
-      const parts = [];
-      if (msg.content && typeof msg.content === 'string') {
-        parts.push({ type: 'text', text: msg.content });
-      } else if (msg.content && Array.isArray(msg.content)) {
-        for (const part of msg.content) {
-          if (part.type === 'text') parts.push(part);
-        }
-      }
-      if (msg.tool_calls) {
-        for (const tc of msg.tool_calls) {
-          parts.push({
-            type: 'tool-call',
-            toolCallId: tc.id,
-            toolName: tc.function?.name || '',
-            input: (typeof tc.function?.arguments === 'string' ? tryParseJSON(tc.function.arguments) : (tc.function?.arguments || {})),
-          });
-        }
-      }
-      return { role: 'assistant', content: parts };
-    }
-    if (msg.role === 'tool') {
-      // tool 内容可能是字符串，也可能是多模态数组（工具返回图片/视频）。
-      // 以前一律 JSON.stringify 成一段文本，媒体就退化成了 base64 字符串文本，
-      // 模型无法把它当媒体看。这里拆成 tool-result（文本）+ 同一消息内的媒体 part。
-      let textValue;
-      const mediaParts = [];
-      if (typeof msg.content === 'string') {
-        textValue = msg.content;
-      } else if (Array.isArray(msg.content)) {
-        textValue = msg.content
-          .filter(c => c && (c.type === 'text' || c.type === 'input_text'))
-          .map(c => c.text || '')
-          .join('');
-        for (const c of msg.content) {
-          if (c && (c.type === 'image_url' || c.type === 'video_url' || c.type === 'audio_url')) mediaParts.push(c);
-          else if (c && (c.type === 'image' || c.type === 'video' || c.type === 'audio' || c.type === 'document')) {
-            mediaParts.push(anthropicMediaToOpenAI(c));
-          }
-        }
-      } else {
-        textValue = JSON.stringify(msg.content ?? '');
-      }
+  const out = [];
+  for (const msg of chatMessages) {
+    buildCcMessage(msg, toolNameMap, out);
+  }
+  return out;
+}
 
-      const toolResult = {
-        type: 'tool-result',
-        toolCallId: msg.tool_call_id,
-        toolName: toolNameMap[msg.tool_call_id] || msg.name || '',
-        output: { type: 'text', value: textValue },
-      };
-      if (mediaParts.length === 0) {
-        return { role: 'tool', content: [toolResult] };
-      }
-      // 媒体随结果一起交给上游；CC 只认 text / image，非图片降级为文本说明
-      const parts = [];
-      let textSeen = false;
-      for (const mp of mediaParts) {
-        const img = toCcImagePart(mp);
-        if (img) { parts.push(img); textSeen = true; }
-        else parts.push({ type: 'text', text: unsupportedMediaText(mediaKindOfPart(mp), '') });
-      }
-      if (!textValue && !textSeen) toolResult.output.value = `[tool result attached ${mediaParts.length} media file(s)]`;
-      return { role: 'tool', content: [toolResult, ...parts] };
+function buildCcMessage(msg, toolNameMap, out) {
+  if (msg.role === 'user') {
+    if (typeof msg.content === 'string') {
+      out.push({ role: 'user', content: [{ type: 'text', text: msg.content }] });
+      return;
     }
-    return msg;
-  });
+    if (Array.isArray(msg.content)) {
+      const parts = [];
+      for (const part of msg.content) {
+        if (part && part.type === 'text') { parts.push(part); continue; }
+        const img = toCcImagePart(part);
+        if (img) { parts.push(img); continue; }
+        // 走到这里：非文本且无法当图片转（视频/音频/远程 URL/未知类型）
+        const url = part?.image_url?.url || part?.video_url?.url || part?.audio_url?.url || part?.source?.url || '';
+        const kind = mediaKindOfPart(part);
+        const isRemote = url && !parseDataUri(url);
+        parts.push({ type: 'text', text: unsupportedMediaText(kind, isRemote ? '远程 URL，CC 只接受 base64 内联图片' : '') });
+        log('warn', 'Unsupported media part downgraded to text', { partType: part?.type, mediaKind: kind, remote: !!isRemote });
+      }
+      out.push({ role: 'user', content: parts });
+      return;
+    }
+    out.push({ role: 'user', content: [{ type: 'text', text: String(msg.content) }] });
+    return;
+  }
+  if (msg.role === 'assistant') {
+    const parts = [];
+    if (msg.content && typeof msg.content === 'string') {
+      parts.push({ type: 'text', text: msg.content });
+    } else if (msg.content && Array.isArray(msg.content)) {
+      for (const part of msg.content) {
+        if (part.type === 'text') parts.push(part);
+      }
+    }
+    if (msg.tool_calls) {
+      for (const tc of msg.tool_calls) {
+        parts.push({
+          type: 'tool-call',
+          toolCallId: tc.id,
+          toolName: tc.function?.name || '',
+          input: (typeof tc.function?.arguments === 'string' ? tryParseJSON(tc.function.arguments) : (tc.function?.arguments || {})),
+        });
+      }
+    }
+    out.push({ role: 'assistant', content: parts });
+    return;
+  }
+  if (msg.role === 'tool') {
+    // tool 内容可能是字符串，也可能是多模态数组（工具返回图片，例如 Read 读图）。
+    // 以前一律 JSON.stringify 成文本，媒体会退化成 base64 字符串文本。
+    let textValue;
+    const mediaParts = [];
+    if (typeof msg.content === 'string') {
+      textValue = msg.content;
+    } else if (Array.isArray(msg.content)) {
+      textValue = msg.content
+        .filter(c => c && (c.type === 'text' || c.type === 'input_text'))
+        .map(c => c.text || '')
+        .join('');
+      for (const c of msg.content) {
+        if (c && (c.type === 'image_url' || c.type === 'video_url' || c.type === 'audio_url')) mediaParts.push(c);
+        else if (c && (c.type === 'image' || c.type === 'video' || c.type === 'audio' || c.type === 'document')) {
+          mediaParts.push(anthropicMediaToOpenAI(c));
+        }
+      }
+    } else {
+      textValue = JSON.stringify(msg.content ?? '');
+    }
+
+    const toolResult = {
+      type: 'tool-result',
+      toolCallId: msg.tool_call_id,
+      toolName: toolNameMap[msg.tool_call_id] || msg.name || '',
+      output: { type: 'text', value: textValue },
+    };
+    out.push({ role: 'tool', content: [toolResult] });
+    if (mediaParts.length === 0) return;
+
+    // ⚠️ 媒体**不能**塞进 role:'tool' 消息里 —— 上游只允许 tool 消息含 tool-result，
+    // 混入 image part 会被拒：Invalid option: expected one of "user"|"assistant"
+    // at "params.messages[N].role"（实测）。正确做法是另起一条 user 消息承载媒体。
+    const mediaOut = [];
+    for (const mp of mediaParts) {
+      const img = toCcImagePart(mp);
+      if (img) mediaOut.push(img);
+      else mediaOut.push({ type: 'text', text: unsupportedMediaText(mediaKindOfPart(mp), '') });
+    }
+    if (mediaOut.length) {
+      out.push({ role: 'user', content: [{ type: 'text', text: '以下是工具返回的媒体内容：' }, ...mediaOut] });
+    }
+    return;
+  }
+  out.push(msg);
 }
 
 function buildCcRequest(openaiReq) {
@@ -1526,23 +1539,23 @@ function convertAnthropicToOpenAI(anthropicReq) {
         }
 
         if (media.length > 0) {
-          // 有媒体：带上文本说明（没有就给个占位，避免模型只看到空内容）
-          // 注意 CC 的 content 只认 text / image，非图片媒体降级为文本说明
-          const parts = [{
-            type: 'text',
-            text: text || `[tool result attached ${media.length} media file(s)]`,
-          }];
-          for (const m of media) {
-            const img = toCcImagePart(m);
-            if (img) parts.push(img);
-            else parts.push({ type: 'text', text: unsupportedMediaText(mediaKindOfPart(m), '') });
-          }
+          // tool 消息本体只放文本结果；媒体另起一条 user 消息。
+          // （上游不允许 role:'tool' 里混入 image part，否则
+          //   Invalid option: expected one of "user"|"assistant" at ...role）
           openaiMessages.push({
             role: 'tool',
             tool_call_id: tr.tool_use_id,
             name: toolNameFromId[tr.tool_use_id] || '',
-            content: parts,
+            content: text || `[tool result attached ${media.length} media file(s)]`,
           });
+          const mediaParts = [{ type: 'text', text: '以下是工具返回的媒体内容：' }];
+          for (const m of media) {
+            const img = toCcImagePart(m);
+            if (img) mediaParts.push(img);
+            else mediaParts.push({ type: 'text', text: unsupportedMediaText(mediaKindOfPart(m), '') });
+          }
+          // 作为数组 content 交给 buildCcMessages 转换
+          openaiMessages.push({ role: 'user', content: mediaParts });
         } else {
           openaiMessages.push({
             role: 'tool',

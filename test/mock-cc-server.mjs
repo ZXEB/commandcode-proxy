@@ -451,14 +451,20 @@ await test('tool_result 夹带图片 → 转成合法 image part', async () => {
   check('HTTP 200', status === 200);
   const msgs = upstreamBodies.at(-1)?.params?.messages || [];
   const toolMsg = msgs.find((m) => m.role === 'tool');
-  const flat = JSON.stringify(toolMsg || {});
-  check('图片数据没有丢失', flat.includes('IMGDATA'), flat.slice(0, 200));
-  check('文本说明也保留', flat.includes('读到了图片'));
-  check('图片 part 合法（image + source.base64）',
-    toolMsg?.content?.some((p) => p.type === 'image' && p.source?.type === 'base64'), flat.slice(0, 200));
+  check('tool 消息里只有 tool-result（不含 image part）',
+    (toolMsg?.content || []).every((p) => p.type === 'tool-result'), JSON.stringify(toolMsg));
+
+  // 媒体必须落在紧随其后的一条 user 消息里 —— 上游不允许 role:'tool' 混入 image
+  const toolIdx = msgs.findIndex((m) => m.role === 'tool');
+  const mediaMsg = msgs[toolIdx + 1];
+  check('媒体放在紧随其后的 user 消息里', mediaMsg?.role === 'user', JSON.stringify(msgs.map((m) => m.role)));
+  check('该 user 消息带合法 image part',
+    mediaMsg?.content?.some((p) => p.type === 'image' && p.source?.type === 'base64' && p.source.data === 'IMGDATA'),
+    JSON.stringify(mediaMsg));
+  check('图片数据没有丢失（在 user 消息里）', JSON.stringify(mediaMsg || {}).includes('IMGDATA'), JSON.stringify(mediaMsg));
 });
 
-await test('tool_result 夹带视频 → 降级为文本说明且 part 合法', async () => {
+await test('tool_result 夹带视频 → 降级为文本说明，且不破坏消息角色', async () => {
   upstreamBodies.length = 0;
   const { status } = await callProxy('scn-ok', true, [
     { role: 'user', content: '读一下这个视频' },
@@ -469,11 +475,13 @@ await test('tool_result 夹带视频 → 降级为文本说明且 part 合法', 
   ]);
   check('HTTP 200', status === 200);
   const msgs = upstreamBodies.at(-1)?.params?.messages || [];
+  // 内部态用 role:'tool' 表示工具结果；关键是它不能夹带 image part
   const toolMsg = msgs.find((m) => m.role === 'tool');
-  const flat = JSON.stringify(toolMsg || {});
-  check('所有 part 合法（仅 text/image）',
-    (toolMsg?.content || []).every((p) => p.type === 'text' || p.type === 'image' || p.type === 'tool-result'), flat.slice(0, 200));
-  check('说明视频无法转发', /视频无法转发/.test(flat), flat.slice(0, 240));
+  check('tool 消息只含 tool-result',
+    (toolMsg?.content || []).every((p) => p.type === 'tool-result'), JSON.stringify(toolMsg));
+  check('视频降级说明出现在消息里', /视频无法转发/.test(JSON.stringify(msgs)), JSON.stringify(msgs).slice(0, 300));
+  check('降级说明不含非法 part（无 video_url/image_url）',
+    !/video_url|audio_url|"image_url"/.test(JSON.stringify(msgs)), JSON.stringify(msgs).slice(0, 300));
 });
 
 await test('tool_result 只有图片、没有文本 → 不再变成空结果', async () => {
@@ -487,9 +495,11 @@ await test('tool_result 只有图片、没有文本 → 不再变成空结果', 
   ]);
   const msgs = upstreamBodies.at(-1)?.params?.messages || [];
   const toolMsg = msgs.find((m) => m.role === 'tool');
-  const flat = JSON.stringify(toolMsg || {});
-  check('图片保留', flat.includes('ONLYMEDIA'), flat.slice(0, 160));
-  check('文本位置给出占位说明（不是空字符串）', /attached 1 media/.test(flat), flat.slice(0, 200));
+  const toolIdx = msgs.findIndex((m) => m.role === 'tool');
+  const mediaMsg = msgs[toolIdx + 1];
+  check('图片保留', JSON.stringify(mediaMsg || {}).includes('ONLYMEDIA'), JSON.stringify(msgs).slice(0, 240));
+  check('tool 消息给出占位文本（不是空字符串）',
+    !!toolMsg?.content?.[0]?.output?.value, JSON.stringify(toolMsg));
 });
 
 await test('tool_result 纯文本保持原样（回归）', async () => {

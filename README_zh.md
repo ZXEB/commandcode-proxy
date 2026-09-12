@@ -177,6 +177,7 @@ commandcode/
 | `useProviderModels` | `true` | 从 Provider API 动态拉取模型列表 |
 | `modelRefreshIntervalMs` | `300000` | 模型列表缓存刷新间隔（5min） |
 | `quotaTimeoutMs` | `45000` | 账单接口单请求超时（这几个接口实测 8~20s，别调太小） |
+| `maxBodySize` | `67108864` | 请求体上限（字节，默认 64MB）。多模态请求（视频/图片 base64）可能很大，超限返回 413 |
 
 另有可选的 `config.local.json`：字段与 `config.json` 完全一致，**优先级更高**（先读 `config.json`，再用它覆盖）。控制台 `[4]` 保存的 API Key 就落在这里；该文件已在 `.gitignore` / `.dockerignore` 中排除，不会被提交或打进镜像。
 
@@ -193,6 +194,7 @@ commandcode/
 | `CC_TUI` | 强制开/关交互式控制台（见上文） |
 | `CC_API_KEY` | 控制台用的 API Key（不参与请求侧鉴权） |
 | `CC_QUOTA_TIMEOUT_MS` | 账单接口超时（等价 `quotaTimeoutMs`） |
+| `CC_MAX_BODY_SIZE` | 请求体上限字节数（等价 `maxBodySize`） |
 
 ## API 接口
 
@@ -236,6 +238,22 @@ OpenAI Chat Completions 兼容。支持流式和非流式、工具调用、多�
   }]
 }
 ```
+
+**视频 / 音频输入：**
+
+代理按 data URI 的 **MIME 类型**决定转成什么 part，而不是一律当图片：
+
+| 输入 | 转成 | 说明 |
+|------|------|------|
+| `data:image/*` | `{ type: "image", image }` | CC CLI 的原生图片格式 |
+| `data:video/*` | `{ type: "video_url", video_url: { url } }` | 不再被伪装成 image |
+| `data:audio/*` | `{ type: "audio_url", audio_url: { url } }` | — |
+| 已是 `video_url` / `audio_url` part | 原样透传 | — |
+| Anthropic `{ type: "video", source: {...} }` | → `video_url` | 以前会被静默丢弃 |
+
+> ⚠️ **模型是否支持视频由上游决定**。代理只负责如实传递，不会替你判断某个模型能否吃视频；如果上游不接受，请在客户端换用支持该模态的模型。
+>
+> 💡 **体积**：视频 base64 后很大，默认请求体上限已放宽到 64MB（`maxBodySize` 可调）。超限时返回 **413** 并说明当前体积与上限，不会掐断连接。
 
 **工具调用：**
 ```json
@@ -372,6 +390,7 @@ data: {"type":"message_stop"}
 |-----------|------|
 | 400 | 请求格式错误 |
 | 401 | API Key 缺失/格式不对/无效（Key 必须以 `user_` 开头；通过 `Authorization: Bearer` 或 `x-api-key` 传入） |
+| 413 | 请求体超过 `maxBodySize`（默认 64MB，大视频 base64 常见）——带明确体积与上限说明，不会掐断连接 |
 | 429 | 零输出 token，或流空闲超时（30s 流式 / 90s 非流式）——带 `Retry-After`，SDK 自动重试；连续 3 次超时返回"压缩上下文"提示 |
 | 502 | CC 上游错误 |
 

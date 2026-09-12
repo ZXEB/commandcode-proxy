@@ -24,6 +24,7 @@ function loadConfig() {
     useProviderModels: true,
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
     quotaTimeoutMs: 45000,                   // CC 账单接口实测 8~20s，超时给足
+    maxBodySize: 64 * 1024 * 1024,           // 64MB — 多模态请求（视频 base64）可能很大
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -169,7 +170,10 @@ async function doRefreshCCVersion() {
 refreshCCVersion(); // 启动时立即拉取
 const ccVersionTimer = setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
 
-const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB — 请求体大小上限
+// 请求体上限。多模态请求（图片/视频 base64）天然很大，10MB 太紧：
+// 一个几十秒的视频 base64 后轻松超过，会被服务端拒收。
+// 默认 64MB，可用 config.json 的 maxBodySize 或环境变量 CC_MAX_BODY_SIZE 调整（单位字节）。
+const MAX_BODY_SIZE = parseInt(process.env.CC_MAX_BODY_SIZE || '', 10) || CFG.maxBodySize || 64 * 1024 * 1024;
 const STREAM_IDLE_TIMEOUT_MS = 90000;   // 90s — 流式无新数据中断（thinking/排队期上游常静默超过 30s，30s 会掐断还活着的流）
 const NONSTREAM_IDLE_TIMEOUT_MS = 90000; // 90s — 非流式超时更宽容
 const SSE_KEEPALIVE_INTERVAL_MS = parseInt(process.env.SSE_KEEPALIVE_INTERVAL_MS || '') || 15000; // 15s — 上游静默期向客户端发 SSE 注释行保活（测试可用环境变量覆盖）
@@ -420,41 +424,35 @@ function getEnvironment() {
 
 // ── CC 请求体构建 ─────────────────────────────────
 
-function buildCcRequest(openaiReq) {
-  const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls } = openaiReq;
+// 从 data URI 判断媒体类型：'video' | 'image' | 'audio' | null
+function mediaKindOfUrl(url) {
+  if (typeof url !== 'string') return null;
+  const m = url.match(/^data:([a-z]+\/[\w.+-]+)/i);
+  if (!m) return null;
+  const top = m[1].toLowerCase().split('/')[0];
+  return ['video', 'image', 'audio'].includes(top) ? top : null;
+}
 
-  // 从 messages 中提取 system prompt
-  const systemMsgs = messages.filter(m => m.role === 'system');
-  const systemPrompt = systemMsgs.map(m => m.content).join('\n');
-  const chatMessages = messages.filter(m => m.role !== 'system');
-
-  // Build tool_call_id → tool_name reverse lookup
-  const toolNameMap = {};
-  for (const msg of chatMessages) {
-    if (msg.role === 'assistant' && msg.tool_calls) {
-      for (const tc of msg.tool_calls) {
-        if (tc.id) {
-          toolNameMap[tc.id] = tc.function?.name || '';
-        }
-      }
-    }
-  }
-
-  // 转换 messages 为 CC 格式
-  const ccMessages = chatMessages.map(msg => {
+// 转换 messages 为 CC 格式（OpenAI chat 消息 → CC messages）
+function buildCcMessages(chatMessages, toolNameMap) {
+  return chatMessages.map(msg => {
     if (msg.role === 'user') {
       if (typeof msg.content === 'string') {
         return { role: 'user', content: [{ type: 'text', text: msg.content }] };
       }
-      // 多模态：数组 content 原样透传（text + image_url → CC image 格式）
       if (Array.isArray(msg.content)) {
         const parts = msg.content.map(part => {
           if (part.type === 'image_url') {
             const url = part.image_url?.url || '';
-            // CC CLI 真实格式: { type: "image", image: "data:image/jpeg;base64,..." }
-            return { type: 'image', image: url };
+            // 按 data URI 的真实 MIME 决定 part 类型：
+            // 以前不管内容是什么都塞成 image，视频会被伪装成图片发给上游
+            // （实测 data:video/mp4 → {type:"image"}），模型自然处理不了。
+            const kind = mediaKindOfUrl(url);
+            if (kind === 'video') return { type: 'video_url', video_url: { url } };
+            if (kind === 'audio') return { type: 'audio_url', audio_url: { url } };
+            return { type: 'image', image: url };   // CC CLI 真实格式
           }
-          return part;
+          return part;                               // video_url / audio_url 等原样透传
         }).filter(Boolean);
         return { role: 'user', content: parts };
       }
@@ -494,6 +492,29 @@ function buildCcRequest(openaiReq) {
     }
     return msg;
   });
+}
+
+function buildCcRequest(openaiReq) {
+  const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls } = openaiReq;
+
+  // 从 messages 中提取 system prompt
+  const systemMsgs = messages.filter(m => m.role === 'system');
+  const systemPrompt = systemMsgs.map(m => m.content).join('\n');
+  const chatMessages = messages.filter(m => m.role !== 'system');
+
+  // Build tool_call_id → tool_name reverse lookup
+  const toolNameMap = {};
+  for (const msg of chatMessages) {
+    if (msg.role === 'assistant' && msg.tool_calls) {
+      for (const tc of msg.tool_calls) {
+        if (tc.id) {
+          toolNameMap[tc.id] = tc.function?.name || '';
+        }
+      }
+    }
+  }
+
+  const ccMessages = buildCcMessages(chatMessages, toolNameMap);
 
   const threadId = newThreadId();
 
@@ -761,23 +782,44 @@ function mapCcError(ccStatus, ccBody) {
 
 // ── HTTP 请求处理 ──────────────────────────────────
 
+// 请求体超限错误：带上状态码与提示，供上层回一个规范的 HTTP 错误
+class BodyTooLargeError extends Error {
+  constructor(size) {
+    super(`Request body too large: ${(size / 1048576).toFixed(1)}MB exceeds limit of ${(MAX_BODY_SIZE / 1048576).toFixed(0)}MB`);
+    this.name = 'BodyTooLargeError';
+    this.status = 413;
+    this.size = size;
+  }
+}
+
+// 读请求体。超限时**不能**调用 req.destroy() 就完事 —— 那会把连接直接掐断，
+// 客户端只收到裸 ECONNRESET，没有任何状态码和错误体，只能不停重连
+// （实测：Z Code 发视频就是这么卡在"正在重连中"的）。
+// 正确做法：停止累积、把剩余数据读完丢弃，然后让上层回一个规范的 413。
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let totalSize = 0;
+    let overflowed = false;
+
     req.on('data', c => {
       totalSize += c.length;
+      if (overflowed) return;                    // 已超限：继续消费但不保留
       if (totalSize > MAX_BODY_SIZE) {
-        req.destroy(new Error('Request body too large'));
-        reject(new Error('Request body exceeds 10MB limit'));
+        overflowed = true;
+        chunks.length = 0;                       // 释放已缓冲的内存
+        reject(new BodyTooLargeError(totalSize));
+        return;
       }
       chunks.push(c);
     });
     req.on('end', () => {
+      if (overflowed) return;                    // 已 reject，等连接自然收尾
       try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
       catch { reject(new Error('Invalid JSON')); }
     });
     req.on('error', reject);
+    req.on('aborted', () => { if (!overflowed) reject(new Error('Request aborted')); });
   });
 }
 
@@ -843,7 +885,19 @@ async function handleChatCompletions(req, res) {
   let openaiReq;
   try {
     openaiReq = await readBody(req);
-  } catch {
+  } catch (e) {
+    if (e instanceof BodyTooLargeError) {
+      log('warn', 'Request body too large', { sizeMB: +(e.size / 1048576).toFixed(1), limitMB: MAX_BODY_SIZE / 1048576 });
+      sendJSON(res, 413, {
+        error: {
+          message: `Request body too large (${(e.size / 1048576).toFixed(1)}MB > ${(MAX_BODY_SIZE / 1048576).toFixed(0)}MB limit). `
+            + 'Large media (video/image base64) is usually the cause; raise maxBodySize in config.json if you need more.',
+          type: 'invalid_request_error',
+        },
+        retry_after: 0,
+      });
+      return;
+    }
     sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
     return;
   }
@@ -1242,6 +1296,29 @@ function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage,
   };
 }
 
+// Anthropic 媒体块 → OpenAI 风格 content part
+//   { type:'image', source:{ type:'base64', media_type:'image/png', data:'...' } }
+//   { type:'video', source:{ type:'base64', media_type:'video/mp4', data:'...' } }
+//   { type:'image', source:{ type:'url', url:'https://...' } }
+// 转成 data URI（base64）或直接 URL，交给 buildCcMessages 按 MIME 分类。
+function anthropicMediaToOpenAI(block) {
+  const kind = block.type;                    // image | video | audio | document
+  const src = block.source || {};
+  let url = '';
+  if (src.type === 'base64' && src.data) {
+    url = `data:${src.media_type || `${kind}/octet-stream`};base64,${src.data}`;
+  } else if (src.type === 'url' && src.url) {
+    url = src.url;
+  } else if (typeof block.data === 'string') {
+    url = `data:${block.media_type || `${kind}/octet-stream`};base64,${block.data}`;
+  }
+
+  if (kind === 'image') return { type: 'image_url', image_url: { url } };
+  if (kind === 'video') return { type: 'image_url', image_url: { url } };  // MIME 决定实际类型
+  if (kind === 'audio') return { type: 'image_url', image_url: { url } };
+  return { type: 'text', text: `[${kind} attachment omitted]` };
+}
+
 function convertAnthropicToOpenAI(anthropicReq) {
   // 1. Extract system prompt (top-level, not in messages array)
   let systemPrompt = '';
@@ -1291,6 +1368,7 @@ function convertAnthropicToOpenAI(anthropicReq) {
     } else if (msg.role === 'user') {
       let textContent = '';
       const toolResults = [];
+      const mediaBlocks = [];   // 图片/视频/音频等非文本块
       if (typeof msg.content === 'string') {
         textContent = msg.content;
       } else if (Array.isArray(msg.content)) {
@@ -1299,6 +1377,10 @@ function convertAnthropicToOpenAI(anthropicReq) {
             textContent += block.text || '';
           } else if (block.type === 'tool_result') {
             toolResults.push(block);
+          } else if (block.type === 'image' || block.type === 'video' || block.type === 'audio' || block.type === 'document') {
+            // Anthropic 媒体块 → 之前既不认也没转，会被静默丢弃
+            // （实测：video 块发进来后上游只收到 text，视频凭空消失）
+            mediaBlocks.push(block);
           }
         }
       }
@@ -1315,7 +1397,13 @@ function convertAnthropicToOpenAI(anthropicReq) {
           content: toolContent,
         });
       }
-      if (textContent) {
+      // 有媒体块时用数组 content（OpenAI 多模态格式），供 buildCcMessages 转换
+      if (mediaBlocks.length > 0) {
+        const contentParts = [];
+        if (textContent) contentParts.push({ type: 'text', text: textContent });
+        for (const b of mediaBlocks) contentParts.push(anthropicMediaToOpenAI(b));
+        openaiMessages.push({ role: 'user', content: contentParts });
+      } else if (textContent) {
         openaiMessages.push({ role: 'user', content: textContent });
       }
     }
@@ -1747,7 +1835,14 @@ async function handleMessages(req, res) {
   let anthropicReq;
   try {
     anthropicReq = await readBody(req);
-  } catch {
+  } catch (e) {
+    if (e instanceof BodyTooLargeError) {
+      log('warn', 'Request body too large', { sizeMB: +(e.size / 1048576).toFixed(1), limitMB: MAX_BODY_SIZE / 1048576 });
+      sendAnthropicError(res, 413, 'invalid_request_error',
+        `Request body too large (${(e.size / 1048576).toFixed(1)}MB > ${(MAX_BODY_SIZE / 1048576).toFixed(0)}MB limit). `
+        + 'Large media (video/image base64) is usually the cause; raise maxBodySize in config.json if you need more.');
+      return;
+    }
     sendAnthropicError(res, 400, 'invalid_request_error', 'Invalid JSON body');
     return;
   }

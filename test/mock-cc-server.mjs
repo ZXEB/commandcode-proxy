@@ -92,6 +92,7 @@ const mock = http.createServer(async (req, res) => {
     try {
       if (req.url === '/alpha/generate' && req.method === 'POST') {
         const parsed = JSON.parse(body || '{}');
+        upstreamBodies.push(parsed);
         const model = parsed?.params?.model || 'scn-ok';
         await sendScenario(res, model, parsed);
       } else {
@@ -107,6 +108,7 @@ const mock = http.createServer(async (req, res) => {
 
 // ── 启动 proxy ────────────────────────────────────────
 const proxyLogs = [];
+const upstreamBodies = [];   // 上游实际收到的 CC 请求体（校验媒体 part 转换）
 function startProxy() {
   const child = spawn(process.execPath, [path.join(ROOT, 'proxy.mjs')], {
     cwd: ROOT,
@@ -115,6 +117,7 @@ function startProxy() {
       PORT: String(PROXY_PORT),
       CC_API_BASE: `http://127.0.0.1:${MOCK_PORT}`,
       SSE_KEEPALIVE_INTERVAL_MS: '300',
+      CC_MAX_BODY_SIZE: String(2 * 1024 * 1024),  // 收紧到 2MB，便于测超限
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -144,6 +147,18 @@ async function callProxy(model, stream = true, messages) {
       messages: messages || [{ role: 'user', content: 'hi' }],
     }),
     signal: AbortSignal.timeout(20000), // 单请求超时：挂起时让用例失败而不是卡死整个套件
+  });
+  const text = await res.text();
+  return { status: res.status, text };
+}
+
+// OpenAI Chat Completions 路由（多模态 part 走的是这条）
+async function callOpenAI(model, messages) {
+  const res = await fetch(`http://127.0.0.1:${PROXY_PORT}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${PROXY_KEY}` },
+    body: JSON.stringify({ model, messages, max_tokens: 100 }),
+    signal: AbortSignal.timeout(20000),
   });
   const text = await res.text();
   return { status: res.status, text };
@@ -294,6 +309,77 @@ await test('scn-strict-tools：孤儿 tool_result（引用未知 call）→ 丢�
   ]);
   check('HTTP 200', status === 200);
   check('无 error 事件', !text.includes('event: error'), text);
+});
+
+await test('多模态：data:video/mp4 经 image_url 传入 → 转成 video_url（不再伪装成 image）', async () => {
+  upstreamBodies.length = 0;
+  const { status } = await callOpenAI('scn-ok', [
+    { role: 'user', content: [
+      { type: 'text', text: '看视频' },
+      { type: 'image_url', image_url: { url: 'data:video/mp4;base64,AAAA' } },
+    ] },
+  ]);
+  check('HTTP 200', status === 200);
+  const parts = upstreamBodies.at(-1)?.params?.messages?.[0]?.content || [];
+  const media = parts.find((p) => p.type !== 'text');
+  check('视频被识别为 video_url', media?.type === 'video_url', JSON.stringify(media));
+  check('data URI 原样保留', media?.video_url?.url === 'data:video/mp4;base64,AAAA');
+});
+
+await test('多模态：data:image/png 仍然转成 image（回归，不影响图片）', async () => {
+  upstreamBodies.length = 0;
+  await callOpenAI('scn-ok', [
+    { role: 'user', content: [
+      { type: 'text', text: '看图' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,BBBB' } },
+    ] },
+  ]);
+  const parts = upstreamBodies.at(-1)?.params?.messages?.[0]?.content || [];
+  const media = parts.find((p) => p.type !== 'text');
+  check('图片仍是 image', media?.type === 'image', JSON.stringify(media));
+  check('image 字段承载 data URI', media?.image === 'data:image/png;base64,BBBB');
+});
+
+await test('多模态：Anthropic 路由的 video 块不再被静默丢弃', async () => {
+  upstreamBodies.length = 0;
+  const { status } = await callProxy('scn-ok', true, [
+    { role: 'user', content: [
+      { type: 'text', text: '看视频' },
+      { type: 'video', source: { type: 'base64', media_type: 'video/mp4', data: 'CCCC' } },
+    ] },
+  ]);
+  check('HTTP 200', status === 200);
+  const parts = upstreamBodies.at(-1)?.params?.messages?.[0]?.content || [];
+  const media = parts.find((p) => p.type !== 'text');
+  check('video 块被转成 video_url', media?.type === 'video_url', JSON.stringify(parts));
+  check('内容随 data URI 一起带上', (media?.video_url?.url || '').includes('data:video/mp4;base64,CCCC'));
+});
+
+await test('超限请求：返回规范 413 而不是掐断连接（曾导致客户端卡在"重连中"）', async () => {
+  // 限制已收紧到 2MB，这里发 5MB
+  const bigBody = JSON.stringify({
+    model: 'scn-ok', max_tokens: 10,
+    messages: [{ role: 'user', content: [
+      { type: 'text', text: '看视频' },
+      { type: 'video', source: { type: 'base64', media_type: 'video/mp4', data: 'A'.repeat(5 * 1024 * 1024) } },
+    ] }],
+  });
+  const res = await fetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${PROXY_KEY}`, 'anthropic-version': '2023-06-01' },
+    body: bigBody,
+    signal: AbortSignal.timeout(20000),
+  });
+  const text = await res.text();
+  check('返回 HTTP 413（而不是连接被重置）', res.status === 413, `got ${res.status}`);
+  check('错误体说明体积与上限', /too large/i.test(text) && /MB/.test(text), text.slice(0, 200));
+  check('提示可调大 maxBodySize', text.includes('maxBodySize'), text.slice(0, 200));
+});
+
+await test('超限后代理仍存活，正常请求不受影响', async () => {
+  const { status, text } = await callProxy('scn-ok');
+  check('HTTP 200', status === 200);
+  check('正常返回内容', text.includes('hello'), text.slice(0, 200));
 });
 
 console.log('\n──── proxy 日志（截选）────');

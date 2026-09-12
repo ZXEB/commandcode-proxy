@@ -177,6 +177,7 @@ Notes:
 | `useProviderModels` | `true` | Dynamically fetch model list from Provider API |
 | `modelRefreshIntervalMs` | `300000` | Model list cache refresh interval (5 min) |
 | `quotaTimeoutMs` | `45000` | Per-request timeout for billing endpoints (measured 8–20s — don't set it too low) |
+| `maxBodySize` | `67108864` | Request body limit in bytes (64MB default). Multimodal payloads (video base64) get large; exceeding it returns 413 |
 
 An optional `config.local.json` may also be present: same fields as `config.json`, but it **takes precedence** (`config.json` is read first, then overridden by this file). The API key saved by console menu `[4]` lands here; the file is excluded via `.gitignore` / `.dockerignore`, so it is never committed or baked into an image.
 
@@ -193,6 +194,7 @@ An optional `config.local.json` may also be present: same fields as `config.json
 | `CC_TUI` | Force the interactive console on/off (see above) |
 | `CC_API_KEY` | API key used by the console (not used for request-side auth) |
 | `CC_QUOTA_TIMEOUT_MS` | Billing endpoint timeout (same as `quotaTimeoutMs`) |
+| `CC_MAX_BODY_SIZE` | Request body limit in bytes (same as `maxBodySize`) |
 
 ## API Endpoints
 
@@ -236,6 +238,22 @@ OpenAI Chat Completions compatible. Supports streaming, non-streaming, tool call
   }]
 }
 ```
+
+**Video / audio input:**
+
+The proxy picks the part type from the data URI's **MIME type** instead of assuming everything is an image:
+
+| Input | Converted to | Notes |
+|-------|--------------|-------|
+| `data:image/*` | `{ type: "image", image }` | The CC CLI's native image format |
+| `data:video/*` | `{ type: "video_url", video_url: { url } }` | No longer disguised as an image |
+| `data:audio/*` | `{ type: "audio_url", audio_url: { url } }` | — |
+| An existing `video_url` / `audio_url` part | passed through | — |
+| Anthropic `{ type: "video", source: {...} }` | → `video_url` | Used to be dropped silently |
+
+> ⚠️ **Whether a model accepts video is decided upstream.** The proxy only forwards faithfully; it does not decide for you whether a given model can handle video. If upstream rejects it, switch to a model that supports that modality.
+>
+> 💡 **Size**: video base64 gets large, so the default body limit is a roomy 64MB (tunable via `maxBodySize`). When exceeded the proxy returns **413** stating the actual size and the limit instead of dropping the connection.
 
 **Tool calling:**
 ```json
@@ -372,6 +390,7 @@ Health check. Returns `OK`.
 |-------------|-------------|
 | 400 | Invalid request format |
 | 401 | API Key missing / invalid format / rejected (Key must start with `user_`; sent via `Authorization: Bearer` or `x-api-key`) |
+| 413 | Request body exceeds `maxBodySize` (64MB default; large video base64 is the usual cause) — states the actual size and limit, never drops the connection |
 | 429 | Zero output tokens, or idle timeout (30s streaming / 90s non-streaming) — SDK auto-retry with `Retry-After`; after 3 consecutive timeouts a "reduce context" hint is returned |
 | 502 | CC upstream error |
 

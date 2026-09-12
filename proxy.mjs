@@ -424,14 +424,15 @@ function getEnvironment() {
 
 // ── CC 请求体构建 ─────────────────────────────────
 
-// ── CC API 的 content part 格式（权威来源：官方 CLI 的 blockToContents 与
-//    上游 400 校验信息）──
-//   { type: 'text',  text: '...' }
-//   { type: 'image', source: { type: 'base64', media_type: 'image/png', data: '...' } }
-// 注意：**没有 video / audio part 类型**，媒体只认 image。
-// 之前我用过 { type:'image', image:'data:...' }、video_url、image_url —— 全都不对，
-// 上游会回 400：expected "text" | "image" at params.messages[0].content[1].type
-//      / expected object at params.messages[0].content[1].source
+// ── CC API 的 content part 格式（权威来源：上游 400 校验信息里列出的全部合法类型）──
+//   text · image · image · document · search_result · thinking · redacted_thinking
+//   reasoning · tool_use · tool-call · tool_result · server_tool_use
+//   web_search_tool_result · web_fetch_tool_result · tool-result
+// image 有两种合法写法：
+//   { type:'image', source:{ type:'base64', media_type:'image/png', data:'...' } }   ← 实测可用
+//   { type:'image', image:'<base64 或 data URI>' }
+// **列表里没有 video / audio**，而且实测带 video/mp4 会被业务层拒绝：
+//   'file part media type video/mp4' functionality not supported.
 
 // 解析 data URI → { mediaType, data }；非 data URI 返回 null
 function parseDataUri(url) {
@@ -449,65 +450,82 @@ function mediaKindOfUrl(url) {
   return ['video', 'image', 'audio'].includes(top) ? top : null;
 }
 
-// 任意图片形态 → CC 的 image part
-//   { type:'image_url', image_url:{ url:'data:...' } }   (OpenAI)
-//   { type:'image', source:{...} } / { data, mimeType }  (Anthropic / CLI 内部形态)
-// 非图片（视频/音频/未知）→ 返回 null，由调用方降级成文本说明
-function toCcImagePart(part) {
+// 把一个媒体 part 里承载的数据抽出来（各家字段名都不一样，逐个兼容）
+//   Z Code : { type:'video'|'image', mediaType, dataUrl:'data:...' }
+//   内部态 : { type:'video', base64, mimeType, originalSize }
+//   OpenAI : { type:'image_url', image_url:{ url:'data:...' } }
+//   Anthropic: { type:'image', source:{ type:'base64', media_type, data } }
+//   CC 原生 : { type:'image', image:'data:...'|'<base64>' }
+// 返回 { mediaType, data(base64), kind } 或 null
+function readMediaPayload(part) {
   if (!part || typeof part !== 'object') return null;
 
-  // OpenAI 风格
-  if (part.type === 'image_url') {
-    const url = part.image_url?.url || '';
-    const parsed = parseDataUri(url);
-    if (!parsed || parsed.isBase64 === false) {
-      // 远程 URL：CC 只接受 base64，无法直接转，交给调用方降级
-      return null;
-    }
-    const kind = mediaKindOfUrl(url);
-    if (kind !== 'image') return null;
-    return { type: 'image', source: { type: 'base64', media_type: parsed.mediaType, data: parsed.data } };
-  }
+  const pick = (mediaType, raw, fallbackMime = '') => {
+    if (typeof raw !== 'string' || !raw) return null;
+    const parsed = parseDataUri(raw);
+    const data = parsed ? parsed.data : raw;          // 允许直接给纯 base64
+    // 没有 data URI 前缀时，只能靠调用方给的 mime 判断；再不行按图片兜底
+    const mime = parsed?.mediaType || mediaType || fallbackMime;
+    const kind = mime ? String(mime).toLowerCase().split('/')[0] : null;
+    return { mediaType: mime || 'image/png', data, kind };
+  };
 
-  // Anthropic 风格 / CLI 内部 { data, mimeType }
-  const src = part.source || {};
-  if (src.type === 'base64' && typeof src.data === 'string') {
-    const mediaType = src.media_type || part.mimeType || 'image/png';
-    if (String(mediaType).toLowerCase().split('/')[0] !== 'image') return null;
-    return { type: 'image', source: { type: 'base64', media_type: mediaType, data: src.data } };
+  // Z Code 的 dataUrl / 内部态的 base64
+  if (part.dataUrl || part.base64) {
+    return pick(part.mediaType || part.mimeType, part.dataUrl || part.base64);
   }
-  if (typeof part.data === 'string') {
-    const mediaType = part.mimeType || part.media_type || 'image/png';
-    if (String(mediaType).toLowerCase().split('/')[0] !== 'image') return null;
-    return { type: 'image', source: { type: 'base64', media_type: mediaType, data: part.data } };
+  // OpenAI
+  if (part.type === 'image_url') return pick(null, part.image_url?.url);
+  // CC 原生 image 字符串字段（可能是 data URI，也可能是裸 base64 → 视为图片）
+  if (part.type === 'image' && typeof part.image === 'string') {
+    return pick(null, part.image, 'image/png');
   }
+  // Anthropic / CLI：source 对象
+  const src = part.source;
+  if (src && typeof src === 'object') {
+    if (src.type === 'base64' && typeof src.data === 'string') return pick(src.media_type || part.mimeType, src.data);
+    if (src.type === 'url' && typeof src.url === 'string') return pick(src.media_type, src.url);
+  }
+  // 裸 data/mimeType 组合
+  if (typeof part.data === 'string') return pick(part.mimeType || part.media_type, part.data);
 
-  // 已经是 CC 形态的 image part
-  if (part.type === 'image' && part.source && part.source.type === 'base64') return part;
   return null;
 }
 
+// 任意图片形态 → CC 的 image part；非图片（或无法识别）→ null
+function toCcImagePart(part) {
+  if (!part || typeof part !== 'object') return null;
+  // 已经是 CC 原生形态且为图片，原样返回
+  const payload = readMediaPayload(part);
+  if (!payload) return null;
+  if (payload.kind !== 'image') return null;
+  if (!payload.data) return null;
+  return { type: 'image', source: { type: 'base64', media_type: payload.mediaType || 'image/png', data: payload.data } };
+}
+
 // 不支持的媒体 → 降级成文本说明。
-// CC API 的 content part 只有 text 与 image 两种，没有视频类型；
-// 硬塞非 image 的 part 会被上游 400 拒绝，所以这里如实降级并写明原因，
-// 而不是静默丢弃或伪造一个不存在的类型。
+// CC API 的 content part 白名单里没有 video / audio，实测带 video/mp4 会被服务端拒绝：
+//   'file part media type video/mp4' functionality not supported.
+// 所以这里如实降级并写明原因，而不是伪造一个不存在的类型（会让整单 400）。
 function unsupportedMediaText(kind, hint) {
   const label = kind === 'video' ? '视频' : kind === 'audio' ? '音频' : kind === 'image' ? '该图片' : '该媒体';
-  return `[${label}无法转发：Command Code API 的 messages content 只支持 text 与 image 两种 part`
-    + `${kind === 'image' ? '（需为 base64 内联的图片）' : `，不接受${label}`}${hint ? `（${hint}）` : ''}。`
-    + `请在客户端改用 base64 内联图片，或换用支持${kind === 'video' ? '视频' : '该模态'}的其他服务。]`;
+  return `[${label}无法转发：Command Code API 的 messages content 只接受 text / image 等文本类 part`
+    + `${kind === 'image' ? '（图片需为 base64 内联）' : `，服务端明确拒绝${label}（实测返回 'file part media type video/mp4' functionality not supported）`}`
+    + `${hint ? `（${hint}）` : ''}。`
+    + `请在客户端改用图片，或换用支持${kind === 'video' ? '视频' : '该模态'}的其他服务。]`;
 }
 
 // 判断一个媒体块的“真实类型”：优先看 MIME，其次才看块自身的 type
-// （Anthropic 常用 { type:'image', source:{ media_type:'video/mp4' } } 这种形态）
+// （各家字段名不同：Z Code 用 mediaType+dataUrl，Anthropic 用 source.media_type）
 function mediaKindOfPart(part) {
-  const src = part?.source || {};
-  const mime = src.media_type || part?.mimeType || part?.media_type;
+  const mime = part?.mediaType || part?.mimeType || part?.media_type || part?.source?.media_type;
   if (typeof mime === 'string' && mime.includes('/')) {
     const top = mime.toLowerCase().split('/')[0];
     if (['video', 'image', 'audio'].includes(top)) return top;
   }
-  const byUrl = mediaKindOfUrl(src.url || part?.image_url?.url || part?.video_url?.url || part?.audio_url?.url);
+  const byUrl = mediaKindOfUrl(
+    part?.dataUrl || part?.image_url?.url || part?.video_url?.url || part?.audio_url?.url || part?.source?.url || (typeof part?.image === 'string' ? part.image : null),
+  );
   if (byUrl) return byUrl;
   return part?.type || null;
 }

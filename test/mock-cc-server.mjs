@@ -311,7 +311,55 @@ await test('scn-strict-tools：孤儿 tool_result（引用未知 call）→ 丢�
   check('无 error 事件', !text.includes('event: error'), text);
 });
 
-await test('多模态：data:video/mp4 经 image_url 传入 → 不再伪造非法 part，降级为文本并说明', async () => {
+await test('多模态：Z Code 的 mediaType+dataUrl 形态（图片）→ 正确转成 image part', async () => {
+  // Z Code 实际发给模型的图片 part 用的是 mediaType + dataUrl 字段，
+  // 不是 source 也不是 image_url —— 早期版本完全没读这两个字段，会直接降级丢失。
+  upstreamBodies.length = 0;
+  const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  const { status } = await callOpenAI('scn-ok', [
+    { role: 'user', content: [
+      { type: 'text', text: '看图' },
+      { type: 'image', mediaType: 'image/png', dataUrl: `data:image/png;base64,${PNG}` },
+    ] },
+  ]);
+  check('HTTP 200', status === 200);
+  const parts = upstreamBodies.at(-1)?.params?.messages?.[0]?.content || [];
+  const media = parts.find((p) => p.type !== 'text');
+  check('转成合法 image part', media?.type === 'image' && media?.source?.type === 'base64', JSON.stringify(media));
+  check('base64 数据与 media_type 完整保留',
+    media?.source?.data === PNG && media?.source?.media_type === 'image/png', JSON.stringify(media));
+});
+
+await test('多模态：Z Code 内部态（base64+mimeType）→ 正确转成 image part', async () => {
+  upstreamBodies.length = 0;
+  const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  await callOpenAI('scn-ok', [
+    { role: 'user', content: [
+      { type: 'text', text: '看图' },
+      { type: 'image', base64: PNG, mimeType: 'image/png', originalSize: 70 },
+    ] },
+  ]);
+  const parts = upstreamBodies.at(-1)?.params?.messages?.[0]?.content || [];
+  const media = parts.find((p) => p.type !== 'text');
+  check('base64 字段被识别', media?.type === 'image' && media?.source?.data === PNG, JSON.stringify(media));
+});
+
+await test('多模态：Z Code 的视频形态 → 降级为文本（上游不支持 video/mp4）', async () => {
+  upstreamBodies.length = 0;
+  const { status } = await callOpenAI('scn-ok', [
+    { role: 'user', content: [
+      { type: 'text', text: '看视频' },
+      { type: 'video', mediaType: 'video/mp4', dataUrl: 'data:video/mp4;base64,AAAA' },
+    ] },
+  ]);
+  check('HTTP 200', status === 200);
+  const parts = upstreamBodies.at(-1)?.params?.messages?.[0]?.content || [];
+  check('所有 part 合法（仅 text/image）', parts.every((p) => p.type === 'text' || p.type === 'image'), JSON.stringify(parts));
+  check('视频被识别并如实说明（不是静默丢弃）',
+    parts.some((p) => p.type === 'text' && /视频无法转发/.test(p.text || '')), JSON.stringify(parts));
+});
+
+await test('多模态：data:video/mp4 经 image_url 传入 → 不伪造非法 part，降级为文本并说明', async () => {
   upstreamBodies.length = 0;
   const { status } = await callOpenAI('scn-ok', [
     { role: 'user', content: [
@@ -374,7 +422,7 @@ await test('多模态：视频无法转发时降级为文本说明（而不是�
   check('没有出现 video_url / image_url 等非法 part',
     !parts.some((p) => p.type === 'video_url' || p.type === 'image_url'), JSON.stringify(parts));
   const note = parts.map((p) => p.text || '').join(' ');
-  check('如实说明视频无法转发及原因', /视频无法转发/.test(note) && /只支持 text 与 image/.test(note), note);
+  check('如实说明视频无法转发及原因', /视频无法转发/.test(note) && /video\/mp4/.test(note), note);
 });
 
 await test('多模态：远程图片 URL 无法内联 → 降级为文本说明', async () => {

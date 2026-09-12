@@ -241,22 +241,28 @@ OpenAI Chat Completions compatible. Supports streaming, non-streaming, tool call
 
 **Video / audio input:**
 
-The proxy picks the part type from the data URI's **MIME type** instead of assuming everything is an image:
-
-| Input | Converted to | Notes |
-|-------|--------------|-------|
-| `data:image/*` | `{ type: "image", image }` | The CC CLI's native image format |
-| `data:video/*` | `{ type: "video_url", video_url: { url } }` | No longer disguised as an image |
-| `data:audio/*` | `{ type: "audio_url", audio_url: { url } }` | — |
-| An existing `video_url` / `audio_url` part | passed through | — |
-| Anthropic `{ type: "video", source: {...} }` | → `video_url` | Used to be dropped silently |
-| **Media blocks inside `tool_result`** | forwarded as sibling parts | Used to be dropped entirely; media-only results reached the model as an empty string |
-
-> ⚠️ **Whether a model accepts video is decided upstream.** The proxy only forwards faithfully; it does not decide for you whether a given model can handle video. If upstream rejects it, switch to a model that supports that modality.
+> ⚠️ **`messages[].content` in the Command Code API supports only two part types** (source: the official CLI internals plus the upstream 400 validation message):
 >
-> 💡 **Size**: video base64 gets large, and **the same clip often appears several times in context** (e.g. once in the user message and again in the `Read` tool result), so a request can exceed twice a single copy. The default limit is a roomy 64MB (tunable via `maxBodySize`); when exceeded the proxy returns **413** stating the actual size and the limit instead of dropping the connection.
+> ```jsonc
+> { "type": "text",  "text": "..." }
+> { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "..." } }
+> ```
 >
-> Measured: a 6.23MB video stored both in the user message and in a `Read` tool result produced a **16.6MB** request body.
+> **There is no video / audio part type.** Video and audio are downgraded to a text note stating why, instead of fabricating a part upstream rejects (which fails the whole request with a 400).
+
+What the proxy accepts and converts:
+
+| Input | Result |
+|-------|--------|
+| OpenAI `{ type:"image_url", image_url:{ url:"data:image/...;base64,..." } }` | → `{ type:"image", source:{ type:"base64", media_type, data } }` |
+| Anthropic `{ type:"image", source:{ type:"base64", media_type, data } }` | Same (`media_type` and data preserved) |
+| Image blocks inside `tool_result` | Converted to a valid image part and forwarded |
+| Video / audio (any shape) | **Downgraded to a text note** explaining only text and image are supported |
+| Remote image URL (`https://...`) | **Downgraded to a text note** (CC only accepts base64-inlined images; the proxy does not download for you) |
+
+> Everything forwarded is guaranteed to be a valid `text` or `image` part; tests assert this so an illegal part can never cause a 400 again.
+
+> 💡 **Size**: image base64 gets large, and **the same image often appears several times in context** (e.g. once in the user message and again in the `Read` tool result), so a request can exceed twice a single copy. The default limit is a roomy 64MB (tunable via `maxBodySize`); when exceeded the proxy returns **413** stating the actual size and the limit instead of dropping the connection.
 
 **Tool calling:**
 ```json

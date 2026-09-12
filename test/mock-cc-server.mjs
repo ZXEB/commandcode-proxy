@@ -311,7 +311,7 @@ await test('scn-strict-tools：孤儿 tool_result（引用未知 call）→ 丢�
   check('无 error 事件', !text.includes('event: error'), text);
 });
 
-await test('多模态：data:video/mp4 经 image_url 传入 → 转成 video_url（不再伪装成 image）', async () => {
+await test('多模态：data:video/mp4 经 image_url 传入 → 不再伪造非法 part，降级为文本并说明', async () => {
   upstreamBodies.length = 0;
   const { status } = await callOpenAI('scn-ok', [
     { role: 'user', content: [
@@ -321,12 +321,12 @@ await test('多模态：data:video/mp4 经 image_url 传入 → 转成 video_url
   ]);
   check('HTTP 200', status === 200);
   const parts = upstreamBodies.at(-1)?.params?.messages?.[0]?.content || [];
-  const media = parts.find((p) => p.type !== 'text');
-  check('视频被识别为 video_url', media?.type === 'video_url', JSON.stringify(media));
-  check('data URI 原样保留', media?.video_url?.url === 'data:video/mp4;base64,AAAA');
+  check('未生成 video_url / image 等非法 part',
+    parts.every((p) => p.type === 'text' || p.type === 'image'), JSON.stringify(parts));
+  check('降级为文本并说明视频无法转发', /视频无法转发/.test(JSON.stringify(parts)), JSON.stringify(parts));
 });
 
-await test('多模态：data:image/png 仍然转成 image（回归，不影响图片）', async () => {
+await test('多模态：data:image/png → CC 原生 image part（source.base64）', async () => {
   upstreamBodies.length = 0;
   await callOpenAI('scn-ok', [
     { role: 'user', content: [
@@ -336,11 +336,30 @@ await test('多模态：data:image/png 仍然转成 image（回归，不影响�
   ]);
   const parts = upstreamBodies.at(-1)?.params?.messages?.[0]?.content || [];
   const media = parts.find((p) => p.type !== 'text');
-  check('图片仍是 image', media?.type === 'image', JSON.stringify(media));
-  check('image 字段承载 data URI', media?.image === 'data:image/png;base64,BBBB');
+  check('part 类型是 image', media?.type === 'image', JSON.stringify(media));
+  check('使用 source.base64 形态（上游只认这个）',
+    media?.source?.type === 'base64' && media?.source?.data === 'BBBB' && media?.source?.media_type === 'image/png',
+    JSON.stringify(media));
+  check('不再出现自创的 image 字段 / image_url / video_url',
+    !('image' in (media || {})) && media?.type !== 'image_url' && media?.type !== 'video_url', JSON.stringify(media));
 });
 
-await test('多模态：Anthropic 路由的 video 块不再被静默丢弃', async () => {
+await test('多模态：Anthropic image 块 → CC 原生 image part（source 透传）', async () => {
+  upstreamBodies.length = 0;
+  await callProxy('scn-ok', true, [
+    { role: 'user', content: [
+      { type: 'text', text: '看图' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: 'JPEGDATA' } },
+    ] },
+  ]);
+  const parts = upstreamBodies.at(-1)?.params?.messages?.[0]?.content || [];
+  const media = parts.find((p) => p.type !== 'text');
+  check('转成 image part', media?.type === 'image', JSON.stringify(media));
+  check('数据与 media_type 完整保留',
+    media?.source?.data === 'JPEGDATA' && media?.source?.media_type === 'image/jpeg', JSON.stringify(media));
+});
+
+await test('多模态：视频无法转发时降级为文本说明（而不是伪造 part 或静默丢弃）', async () => {
   upstreamBodies.length = 0;
   const { status } = await callProxy('scn-ok', true, [
     { role: 'user', content: [
@@ -348,20 +367,55 @@ await test('多模态：Anthropic 路由的 video 块不再被静默丢弃', asy
       { type: 'video', source: { type: 'base64', media_type: 'video/mp4', data: 'CCCC' } },
     ] },
   ]);
-  check('HTTP 200', status === 200);
+  check('HTTP 200（不再因非法 part 被上游 400）', status === 200);
   const parts = upstreamBodies.at(-1)?.params?.messages?.[0]?.content || [];
-  const media = parts.find((p) => p.type !== 'text');
-  check('video 块被转成 video_url', media?.type === 'video_url', JSON.stringify(parts));
-  check('内容随 data URI 一起带上', (media?.video_url?.url || '').includes('data:video/mp4;base64,CCCC'));
+  check('所有 part 都是合法类型（仅 text/image）',
+    parts.every((p) => p.type === 'text' || p.type === 'image'), JSON.stringify(parts));
+  check('没有出现 video_url / image_url 等非法 part',
+    !parts.some((p) => p.type === 'video_url' || p.type === 'image_url'), JSON.stringify(parts));
+  const note = parts.map((p) => p.text || '').join(' ');
+  check('如实说明视频无法转发及原因', /视频无法转发/.test(note) && /只支持 text 与 image/.test(note), note);
 });
 
-await test('tool_result 夹带媒体（Read 读视频/图片）→ 不再被丢弃', async () => {
+await test('多模态：远程图片 URL 无法内联 → 降级为文本说明', async () => {
+  upstreamBodies.length = 0;
+  await callOpenAI('scn-ok', [
+    { role: 'user', content: [
+      { type: 'text', text: '看图' },
+      { type: 'image_url', image_url: { url: 'https://example.com/a.png' } },
+    ] },
+  ]);
+  const parts = upstreamBodies.at(-1)?.params?.messages?.[0]?.content || [];
+  check('未生成非法 image part', parts.every((p) => p.type === 'text' || p.type === 'image'), JSON.stringify(parts));
+  check('说明远程 URL 未内联', /远程 URL/.test(JSON.stringify(parts)), JSON.stringify(parts));
+});
+
+await test('tool_result 夹带图片 → 转成合法 image part', async () => {
+  upstreamBodies.length = 0;
+  const { status } = await callProxy('scn-ok', true, [
+    { role: 'user', content: '读一下这个图片' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'call_v1', name: 'Read', input: { file_path: 'x.png' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_v1', content: [
+      { type: 'text', text: '读到了图片' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'IMGDATA' } },
+    ] }] },
+  ]);
+  check('HTTP 200', status === 200);
+  const msgs = upstreamBodies.at(-1)?.params?.messages || [];
+  const toolMsg = msgs.find((m) => m.role === 'tool');
+  const flat = JSON.stringify(toolMsg || {});
+  check('图片数据没有丢失', flat.includes('IMGDATA'), flat.slice(0, 200));
+  check('文本说明也保留', flat.includes('读到了图片'));
+  check('图片 part 合法（image + source.base64）',
+    toolMsg?.content?.some((p) => p.type === 'image' && p.source?.type === 'base64'), flat.slice(0, 200));
+});
+
+await test('tool_result 夹带视频 → 降级为文本说明且 part 合法', async () => {
   upstreamBodies.length = 0;
   const { status } = await callProxy('scn-ok', true, [
     { role: 'user', content: '读一下这个视频' },
-    { role: 'assistant', content: [{ type: 'tool_use', id: 'call_v1', name: 'Read', input: { file_path: 'x.mp4' } }] },
-    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_v1', content: [
-      { type: 'text', text: '读到了视频' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'call_v3', name: 'Read', input: { file_path: 'x.mp4' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_v3', content: [
       { type: 'image', source: { type: 'base64', media_type: 'video/mp4', data: 'VIDEODATA' } },
     ] }] },
   ]);
@@ -369,24 +423,24 @@ await test('tool_result 夹带媒体（Read 读视频/图片）→ 不再被丢�
   const msgs = upstreamBodies.at(-1)?.params?.messages || [];
   const toolMsg = msgs.find((m) => m.role === 'tool');
   const flat = JSON.stringify(toolMsg || {});
-  check('工具结果里的视频没有丢失', flat.includes('VIDEODATA'), flat.slice(0, 160));
-  check('文本说明也保留', flat.includes('读到了视频'));
-  check('媒体被标成 video_url', flat.includes('video_url'));
+  check('所有 part 合法（仅 text/image）',
+    (toolMsg?.content || []).every((p) => p.type === 'text' || p.type === 'image' || p.type === 'tool-result'), flat.slice(0, 200));
+  check('说明视频无法转发', /视频无法转发/.test(flat), flat.slice(0, 240));
 });
 
-await test('tool_result 只有媒体、没有文本 → 不再变成空结果', async () => {
+await test('tool_result 只有图片、没有文本 → 不再变成空结果', async () => {
   upstreamBodies.length = 0;
   await callProxy('scn-ok', true, [
-    { role: 'user', content: '读一下这个视频' },
-    { role: 'assistant', content: [{ type: 'tool_use', id: 'call_v2', name: 'Read', input: { file_path: 'x.mp4' } }] },
+    { role: 'user', content: '读一下这张图' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'call_v2', name: 'Read', input: { file_path: 'x.png' } }] },
     { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_v2', content: [
-      { type: 'image', source: { type: 'base64', media_type: 'video/mp4', data: 'ONLYMEDIA' } },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'ONLYMEDIA' } },
     ] }] },
   ]);
   const msgs = upstreamBodies.at(-1)?.params?.messages || [];
   const toolMsg = msgs.find((m) => m.role === 'tool');
   const flat = JSON.stringify(toolMsg || {});
-  check('媒体保留', flat.includes('ONLYMEDIA'), flat.slice(0, 160));
+  check('图片保留', flat.includes('ONLYMEDIA'), flat.slice(0, 160));
   check('文本位置给出占位说明（不是空字符串）', /attached 1 media/.test(flat), flat.slice(0, 200));
 });
 

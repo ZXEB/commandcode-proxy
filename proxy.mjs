@@ -424,13 +424,92 @@ function getEnvironment() {
 
 // ── CC 请求体构建 ─────────────────────────────────
 
-// 从 data URI 判断媒体类型：'video' | 'image' | 'audio' | null
-function mediaKindOfUrl(url) {
+// ── CC API 的 content part 格式（权威来源：官方 CLI 的 blockToContents 与
+//    上游 400 校验信息）──
+//   { type: 'text',  text: '...' }
+//   { type: 'image', source: { type: 'base64', media_type: 'image/png', data: '...' } }
+// 注意：**没有 video / audio part 类型**，媒体只认 image。
+// 之前我用过 { type:'image', image:'data:...' }、video_url、image_url —— 全都不对，
+// 上游会回 400：expected "text" | "image" at params.messages[0].content[1].type
+//      / expected object at params.messages[0].content[1].source
+
+// 解析 data URI → { mediaType, data }；非 data URI 返回 null
+function parseDataUri(url) {
   if (typeof url !== 'string') return null;
-  const m = url.match(/^data:([a-z]+\/[\w.+-]+)/i);
+  const m = url.match(/^data:([^;,]+)?(;base64)?,(.*)$/s);
   if (!m) return null;
-  const top = m[1].toLowerCase().split('/')[0];
+  return { mediaType: m[1] || 'application/octet-stream', isBase64: !!m[2], data: m[3] || '' };
+}
+
+// 从 data URI 判断媒体大类：'video' | 'image' | 'audio' | null
+function mediaKindOfUrl(url) {
+  const parsed = parseDataUri(url);
+  if (!parsed) return null;
+  const top = String(parsed.mediaType).toLowerCase().split('/')[0];
   return ['video', 'image', 'audio'].includes(top) ? top : null;
+}
+
+// 任意图片形态 → CC 的 image part
+//   { type:'image_url', image_url:{ url:'data:...' } }   (OpenAI)
+//   { type:'image', source:{...} } / { data, mimeType }  (Anthropic / CLI 内部形态)
+// 非图片（视频/音频/未知）→ 返回 null，由调用方降级成文本说明
+function toCcImagePart(part) {
+  if (!part || typeof part !== 'object') return null;
+
+  // OpenAI 风格
+  if (part.type === 'image_url') {
+    const url = part.image_url?.url || '';
+    const parsed = parseDataUri(url);
+    if (!parsed || parsed.isBase64 === false) {
+      // 远程 URL：CC 只接受 base64，无法直接转，交给调用方降级
+      return null;
+    }
+    const kind = mediaKindOfUrl(url);
+    if (kind !== 'image') return null;
+    return { type: 'image', source: { type: 'base64', media_type: parsed.mediaType, data: parsed.data } };
+  }
+
+  // Anthropic 风格 / CLI 内部 { data, mimeType }
+  const src = part.source || {};
+  if (src.type === 'base64' && typeof src.data === 'string') {
+    const mediaType = src.media_type || part.mimeType || 'image/png';
+    if (String(mediaType).toLowerCase().split('/')[0] !== 'image') return null;
+    return { type: 'image', source: { type: 'base64', media_type: mediaType, data: src.data } };
+  }
+  if (typeof part.data === 'string') {
+    const mediaType = part.mimeType || part.media_type || 'image/png';
+    if (String(mediaType).toLowerCase().split('/')[0] !== 'image') return null;
+    return { type: 'image', source: { type: 'base64', media_type: mediaType, data: part.data } };
+  }
+
+  // 已经是 CC 形态的 image part
+  if (part.type === 'image' && part.source && part.source.type === 'base64') return part;
+  return null;
+}
+
+// 不支持的媒体 → 降级成文本说明。
+// CC API 的 content part 只有 text 与 image 两种，没有视频类型；
+// 硬塞非 image 的 part 会被上游 400 拒绝，所以这里如实降级并写明原因，
+// 而不是静默丢弃或伪造一个不存在的类型。
+function unsupportedMediaText(kind, hint) {
+  const label = kind === 'video' ? '视频' : kind === 'audio' ? '音频' : kind === 'image' ? '该图片' : '该媒体';
+  return `[${label}无法转发：Command Code API 的 messages content 只支持 text 与 image 两种 part`
+    + `${kind === 'image' ? '（需为 base64 内联的图片）' : `，不接受${label}`}${hint ? `（${hint}）` : ''}。`
+    + `请在客户端改用 base64 内联图片，或换用支持${kind === 'video' ? '视频' : '该模态'}的其他服务。]`;
+}
+
+// 判断一个媒体块的“真实类型”：优先看 MIME，其次才看块自身的 type
+// （Anthropic 常用 { type:'image', source:{ media_type:'video/mp4' } } 这种形态）
+function mediaKindOfPart(part) {
+  const src = part?.source || {};
+  const mime = src.media_type || part?.mimeType || part?.media_type;
+  if (typeof mime === 'string' && mime.includes('/')) {
+    const top = mime.toLowerCase().split('/')[0];
+    if (['video', 'image', 'audio'].includes(top)) return top;
+  }
+  const byUrl = mediaKindOfUrl(src.url || part?.image_url?.url || part?.video_url?.url || part?.audio_url?.url);
+  if (byUrl) return byUrl;
+  return part?.type || null;
 }
 
 // 转换 messages 为 CC 格式（OpenAI chat 消息 → CC messages）
@@ -441,19 +520,18 @@ function buildCcMessages(chatMessages, toolNameMap) {
         return { role: 'user', content: [{ type: 'text', text: msg.content }] };
       }
       if (Array.isArray(msg.content)) {
-        const parts = msg.content.map(part => {
-          if (part.type === 'image_url') {
-            const url = part.image_url?.url || '';
-            // 按 data URI 的真实 MIME 决定 part 类型：
-            // 以前不管内容是什么都塞成 image，视频会被伪装成图片发给上游
-            // （实测 data:video/mp4 → {type:"image"}），模型自然处理不了。
-            const kind = mediaKindOfUrl(url);
-            if (kind === 'video') return { type: 'video_url', video_url: { url } };
-            if (kind === 'audio') return { type: 'audio_url', audio_url: { url } };
-            return { type: 'image', image: url };   // CC CLI 真实格式
-          }
-          return part;                               // video_url / audio_url 等原样透传
-        }).filter(Boolean);
+        const parts = [];
+        for (const part of msg.content) {
+          if (part && part.type === 'text') { parts.push(part); continue; }
+          const img = toCcImagePart(part);
+          if (img) { parts.push(img); continue; }
+          // 走到这里：非文本且无法当图片转（视频/音频/远程 URL/未知类型）
+          const url = part?.image_url?.url || part?.video_url?.url || part?.audio_url?.url || part?.source?.url || '';
+          const kind = mediaKindOfPart(part);
+          const isRemote = url && !parseDataUri(url);
+          parts.push({ type: 'text', text: unsupportedMediaText(kind, isRemote ? '远程 URL，CC 只接受 base64 内联图片' : '') });
+          log('warn', 'Unsupported media part downgraded to text', { partType: part?.type, mediaKind: kind, remote: !!isRemote });
+        }
         return { role: 'user', content: parts };
       }
       return { role: 'user', content: [{ type: 'text', text: String(msg.content) }] };
@@ -511,12 +589,16 @@ function buildCcMessages(chatMessages, toolNameMap) {
       if (mediaParts.length === 0) {
         return { role: 'tool', content: [toolResult] };
       }
-      // 媒体随结果一起交给上游；文本为空时补占位说明
+      // 媒体随结果一起交给上游；CC 只认 text / image，非图片降级为文本说明
       const parts = [];
-      if (!textValue) toolResult.output.value = `[tool result attached ${mediaParts.length} media file(s)]`;
-      parts.push(toolResult);
-      parts.push(...mediaParts);
-      return { role: 'tool', content: parts };
+      let textSeen = false;
+      for (const mp of mediaParts) {
+        const img = toCcImagePart(mp);
+        if (img) { parts.push(img); textSeen = true; }
+        else parts.push({ type: 'text', text: unsupportedMediaText(mediaKindOfPart(mp), '') });
+      }
+      if (!textValue && !textSeen) toolResult.output.value = `[tool result attached ${mediaParts.length} media file(s)]`;
+      return { role: 'tool', content: [toolResult, ...parts] };
     }
     return msg;
   });
@@ -1324,31 +1406,17 @@ function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage,
   };
 }
 
-// Anthropic 媒体块 → OpenAI 风格 content part
+// Anthropic 媒体块 → CC image part
 //   { type:'image', source:{ type:'base64', media_type:'image/png', data:'...' } }
-//   { type:'video', source:{ type:'base64', media_type:'video/mp4', data:'...' } }
 //   { type:'image', source:{ type:'url', url:'https://...' } }
-// 转成 data URI（base64）或直接 URL，并按 MIME 标成 image_url / video_url / audio_url。
+//   { type:'video' | 'audio' | 'document', ... }
+// CC 只支持 text 与 image 两种 part，非图片一律降级成文本说明（不伪造类型、不静默丢弃）。
 function anthropicMediaToOpenAI(block) {
-  const kind = block.type;                    // image | video | audio | document
-  const src = block.source || {};
-  let url = '';
-  if (src.type === 'base64' && src.data) {
-    url = `data:${src.media_type || `${kind}/octet-stream`};base64,${src.data}`;
-  } else if (src.type === 'url' && src.url) {
-    url = src.url;
-  } else if (typeof block.data === 'string') {
-    url = `data:${block.media_type || `${kind}/octet-stream`};base64,${block.data}`;
-  }
-
-  // block.type 与 data URI 的顶层类型都可能表明媒体种类，取更具体的那个
-  const byMime = mediaKindOfUrl(url);
-  const resolved = byMime || (kind === 'document' ? null : kind);
-
-  if (resolved === 'video') return { type: 'video_url', video_url: { url } };
-  if (resolved === 'audio') return { type: 'audio_url', audio_url: { url } };
-  if (resolved === 'image') return { type: 'image_url', image_url: { url } };
-  return { type: 'text', text: `[${kind} attachment omitted]` };
+  const kind = block?.type;                       // image | video | audio | document
+  const img = toCcImagePart(block);
+  if (img) return img;
+  const src = block?.source || {};
+  return { type: 'text', text: unsupportedMediaText(kind, src.type === 'url' ? '远程 URL，CC 只接受 base64 内联图片' : '') };
 }
 
 function convertAnthropicToOpenAI(anthropicReq) {
@@ -1441,11 +1509,16 @@ function convertAnthropicToOpenAI(anthropicReq) {
 
         if (media.length > 0) {
           // 有媒体：带上文本说明（没有就给个占位，避免模型只看到空内容）
+          // 注意 CC 的 content 只认 text / image，非图片媒体降级为文本说明
           const parts = [{
             type: 'text',
             text: text || `[tool result attached ${media.length} media file(s)]`,
           }];
-          for (const m of media) parts.push(anthropicMediaToOpenAI(m));
+          for (const m of media) {
+            const img = toCcImagePart(m);
+            if (img) parts.push(img);
+            else parts.push({ type: 'text', text: unsupportedMediaText(mediaKindOfPart(m), '') });
+          }
           openaiMessages.push({
             role: 'tool',
             tool_call_id: tr.tool_use_id,

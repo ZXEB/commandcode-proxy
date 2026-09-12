@@ -241,22 +241,28 @@ OpenAI Chat Completions 兼容。支持流式和非流式、工具调用、多�
 
 **视频 / 音频输入：**
 
-代理按 data URI 的 **MIME 类型**决定转成什么 part，而不是一律当图片：
-
-| 输入 | 转成 | 说明 |
-|------|------|------|
-| `data:image/*` | `{ type: "image", image }` | CC CLI 的原生图片格式 |
-| `data:video/*` | `{ type: "video_url", video_url: { url } }` | 不再被伪装成 image |
-| `data:audio/*` | `{ type: "audio_url", audio_url: { url } }` | — |
-| 已是 `video_url` / `audio_url` part | 原样透传 | — |
-| Anthropic `{ type: "video", source: {...} }` | → `video_url` | 以前会被静默丢弃 |
-| **`tool_result` 里夹带的媒体块** | 作为同级 part 传给上游 | 以前被整块丢弃；只有媒体时模型会收到空结果 |
-
-> ⚠️ **模型是否支持视频由上游决定**。代理只负责如实传递，不会替你判断某个模型能否吃视频；如果上游不接受，请在客户端换用支持该模态的模型。
+> ⚠️ **Command Code API 的 `messages[].content` 只支持两种 part**（权威来源：官方 CLI 内部实现 + 上游 400 校验信息）：
 >
-> 💡 **体积**：视频 base64 后很大，且**同一段视频常会在上下文里存多份**（例如用户消息一份 + `Read` 工具结果一份），请求体可达单份的两倍以上。默认上限 64MB（`maxBodySize` 可调），超限返回 **413** 并说明当前体积与上限，不会掐断连接。
+> ```jsonc
+> { "type": "text",  "text": "..." }
+> { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "..." } }
+> ```
 >
-> 实测：一个 6.23MB 的视频，在「用户消息 + Read 工具结果」两处各存一份时，请求体达到 **16.6MB**。
+> **没有 video / audio part 类型**。传入视频/音频会被如实降级为一条文本说明（写明原因），而不是伪造一个上游不认的 part 导致整单 400。
+
+代理接收并转换的输入：
+
+| 输入 | 结果 |
+|------|------|
+| OpenAI `{ type:"image_url", image_url:{ url:"data:image/...;base64,..." } }` | → `{ type:"image", source:{ type:"base64", media_type, data } }` |
+| Anthropic `{ type:"image", source:{ type:"base64", media_type, data } }` | 同上（`media_type` 与数据原样保留） |
+| `tool_result` 里夹带的图片块 | 转为合法 image part 一起转发 |
+| 视频 / 音频（任意形态） | **降级为文本说明**，写明「只支持 text 与 image」 |
+| 远程 URL 图片（`https://...`） | **降级为文本说明**（CC 只接受 base64 内联图片，代理不会替你下载） |
+
+> 所有转发内容都保证是 `text` 或 `image` 两种合法 part；测试里对此有断言，避免再次因为非法 part 被上游 400。
+
+> 💡 **体积**：图片 base64 后很大，且**同一张图常会在上下文里存多份**（例如用户消息一份 + `Read` 工具结果一份），请求体可达单份的两倍以上。默认上限 64MB（`maxBodySize` 可调），超限返回 **413** 并说明当前体积与上限，不会掐断连接。
 
 **工具调用：**
 ```json

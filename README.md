@@ -250,10 +250,13 @@ The proxy picks the part type from the data URI's **MIME type** instead of assum
 | `data:audio/*` | `{ type: "audio_url", audio_url: { url } }` | — |
 | An existing `video_url` / `audio_url` part | passed through | — |
 | Anthropic `{ type: "video", source: {...} }` | → `video_url` | Used to be dropped silently |
+| **Media blocks inside `tool_result`** | forwarded as sibling parts | Used to be dropped entirely; media-only results reached the model as an empty string |
 
 > ⚠️ **Whether a model accepts video is decided upstream.** The proxy only forwards faithfully; it does not decide for you whether a given model can handle video. If upstream rejects it, switch to a model that supports that modality.
 >
-> 💡 **Size**: video base64 gets large, so the default body limit is a roomy 64MB (tunable via `maxBodySize`). When exceeded the proxy returns **413** stating the actual size and the limit instead of dropping the connection.
+> 💡 **Size**: video base64 gets large, and **the same clip often appears several times in context** (e.g. once in the user message and again in the `Read` tool result), so a request can exceed twice a single copy. The default limit is a roomy 64MB (tunable via `maxBodySize`); when exceeded the proxy returns **413** stating the actual size and the limit instead of dropping the connection.
+>
+> Measured: a 6.23MB video stored both in the user message and in a `Read` tool result produced a **16.6MB** request body.
 
 **Tool calling:**
 ```json

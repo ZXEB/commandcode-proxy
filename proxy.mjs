@@ -480,15 +480,43 @@ function buildCcMessages(chatMessages, toolNameMap) {
       return { role: 'assistant', content: parts };
     }
     if (msg.role === 'tool') {
-      return {
-        role: 'tool',
-        content: [{
-          type: 'tool-result',
-          toolCallId: msg.tool_call_id,
-          toolName: toolNameMap[msg.tool_call_id] || msg.name || '',
-          output: { type: 'text', value: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content) },
-        }],
+      // tool 内容可能是字符串，也可能是多模态数组（工具返回图片/视频）。
+      // 以前一律 JSON.stringify 成一段文本，媒体就退化成了 base64 字符串文本，
+      // 模型无法把它当媒体看。这里拆成 tool-result（文本）+ 同一消息内的媒体 part。
+      let textValue;
+      const mediaParts = [];
+      if (typeof msg.content === 'string') {
+        textValue = msg.content;
+      } else if (Array.isArray(msg.content)) {
+        textValue = msg.content
+          .filter(c => c && (c.type === 'text' || c.type === 'input_text'))
+          .map(c => c.text || '')
+          .join('');
+        for (const c of msg.content) {
+          if (c && (c.type === 'image_url' || c.type === 'video_url' || c.type === 'audio_url')) mediaParts.push(c);
+          else if (c && (c.type === 'image' || c.type === 'video' || c.type === 'audio' || c.type === 'document')) {
+            mediaParts.push(anthropicMediaToOpenAI(c));
+          }
+        }
+      } else {
+        textValue = JSON.stringify(msg.content ?? '');
+      }
+
+      const toolResult = {
+        type: 'tool-result',
+        toolCallId: msg.tool_call_id,
+        toolName: toolNameMap[msg.tool_call_id] || msg.name || '',
+        output: { type: 'text', value: textValue },
       };
+      if (mediaParts.length === 0) {
+        return { role: 'tool', content: [toolResult] };
+      }
+      // 媒体随结果一起交给上游；文本为空时补占位说明
+      const parts = [];
+      if (!textValue) toolResult.output.value = `[tool result attached ${mediaParts.length} media file(s)]`;
+      parts.push(toolResult);
+      parts.push(...mediaParts);
+      return { role: 'tool', content: parts };
     }
     return msg;
   });
@@ -1300,7 +1328,7 @@ function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage,
 //   { type:'image', source:{ type:'base64', media_type:'image/png', data:'...' } }
 //   { type:'video', source:{ type:'base64', media_type:'video/mp4', data:'...' } }
 //   { type:'image', source:{ type:'url', url:'https://...' } }
-// 转成 data URI（base64）或直接 URL，交给 buildCcMessages 按 MIME 分类。
+// 转成 data URI（base64）或直接 URL，并按 MIME 标成 image_url / video_url / audio_url。
 function anthropicMediaToOpenAI(block) {
   const kind = block.type;                    // image | video | audio | document
   const src = block.source || {};
@@ -1313,9 +1341,13 @@ function anthropicMediaToOpenAI(block) {
     url = `data:${block.media_type || `${kind}/octet-stream`};base64,${block.data}`;
   }
 
-  if (kind === 'image') return { type: 'image_url', image_url: { url } };
-  if (kind === 'video') return { type: 'image_url', image_url: { url } };  // MIME 决定实际类型
-  if (kind === 'audio') return { type: 'image_url', image_url: { url } };
+  // block.type 与 data URI 的顶层类型都可能表明媒体种类，取更具体的那个
+  const byMime = mediaKindOfUrl(url);
+  const resolved = byMime || (kind === 'document' ? null : kind);
+
+  if (resolved === 'video') return { type: 'video_url', video_url: { url } };
+  if (resolved === 'audio') return { type: 'audio_url', audio_url: { url } };
+  if (resolved === 'image') return { type: 'image_url', image_url: { url } };
   return { type: 'text', text: `[${kind} attachment omitted]` };
 }
 
@@ -1387,15 +1419,47 @@ function convertAnthropicToOpenAI(anthropicReq) {
       // tool 消息必须紧跟 assistant(tool_calls)：同一条 user 消息里
       // tool_result 先转，用户文本排在后面
       for (const tr of toolResults) {
-        const toolContent = typeof tr.content === 'string' ? tr.content
-          : Array.isArray(tr.content) ? tr.content.map(c => c.text || '').join('')
-          : String(tr.content || '');
-        openaiMessages.push({
-          role: 'tool',
-          tool_call_id: tr.tool_use_id,
-          name: toolNameFromId[tr.tool_use_id] || '',
-          content: toolContent,
-        });
+        const media = [];   // tool_result 里可能夹带媒体块（如 Read 读视频/图片）
+        let text;
+        if (typeof tr.content === 'string') {
+          text = tr.content;
+        } else if (Array.isArray(tr.content)) {
+          // 以前用 c.text || '' 拼接，非文本块（image/video/document）被整块丢弃，
+          // 若结果只有媒体则变成空字符串，模型收到一个空工具结果。
+          text = tr.content
+            .filter(c => c && c.type === 'text')
+            .map(c => c.text || '')
+            .join('');
+          for (const c of tr.content) {
+            if (c && (c.type === 'image' || c.type === 'video' || c.type === 'audio' || c.type === 'document')) {
+              media.push(c);
+            }
+          }
+        } else {
+          text = String(tr.content || '');
+        }
+
+        if (media.length > 0) {
+          // 有媒体：带上文本说明（没有就给个占位，避免模型只看到空内容）
+          const parts = [{
+            type: 'text',
+            text: text || `[tool result attached ${media.length} media file(s)]`,
+          }];
+          for (const m of media) parts.push(anthropicMediaToOpenAI(m));
+          openaiMessages.push({
+            role: 'tool',
+            tool_call_id: tr.tool_use_id,
+            name: toolNameFromId[tr.tool_use_id] || '',
+            content: parts,
+          });
+        } else {
+          openaiMessages.push({
+            role: 'tool',
+            tool_call_id: tr.tool_use_id,
+            name: toolNameFromId[tr.tool_use_id] || '',
+            content: text,
+          });
+        }
       }
       // 有媒体块时用数组 content（OpenAI 多模态格式），供 buildCcMessages 转换
       if (mediaBlocks.length > 0) {

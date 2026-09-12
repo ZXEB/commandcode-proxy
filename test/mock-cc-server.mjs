@@ -355,6 +355,54 @@ await test('多模态：Anthropic 路由的 video 块不再被静默丢弃', asy
   check('内容随 data URI 一起带上', (media?.video_url?.url || '').includes('data:video/mp4;base64,CCCC'));
 });
 
+await test('tool_result 夹带媒体（Read 读视频/图片）→ 不再被丢弃', async () => {
+  upstreamBodies.length = 0;
+  const { status } = await callProxy('scn-ok', true, [
+    { role: 'user', content: '读一下这个视频' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'call_v1', name: 'Read', input: { file_path: 'x.mp4' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_v1', content: [
+      { type: 'text', text: '读到了视频' },
+      { type: 'image', source: { type: 'base64', media_type: 'video/mp4', data: 'VIDEODATA' } },
+    ] }] },
+  ]);
+  check('HTTP 200', status === 200);
+  const msgs = upstreamBodies.at(-1)?.params?.messages || [];
+  const toolMsg = msgs.find((m) => m.role === 'tool');
+  const flat = JSON.stringify(toolMsg || {});
+  check('工具结果里的视频没有丢失', flat.includes('VIDEODATA'), flat.slice(0, 160));
+  check('文本说明也保留', flat.includes('读到了视频'));
+  check('媒体被标成 video_url', flat.includes('video_url'));
+});
+
+await test('tool_result 只有媒体、没有文本 → 不再变成空结果', async () => {
+  upstreamBodies.length = 0;
+  await callProxy('scn-ok', true, [
+    { role: 'user', content: '读一下这个视频' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'call_v2', name: 'Read', input: { file_path: 'x.mp4' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_v2', content: [
+      { type: 'image', source: { type: 'base64', media_type: 'video/mp4', data: 'ONLYMEDIA' } },
+    ] }] },
+  ]);
+  const msgs = upstreamBodies.at(-1)?.params?.messages || [];
+  const toolMsg = msgs.find((m) => m.role === 'tool');
+  const flat = JSON.stringify(toolMsg || {});
+  check('媒体保留', flat.includes('ONLYMEDIA'), flat.slice(0, 160));
+  check('文本位置给出占位说明（不是空字符串）', /attached 1 media/.test(flat), flat.slice(0, 200));
+});
+
+await test('tool_result 纯文本保持原样（回归）', async () => {
+  upstreamBodies.length = 0;
+  await callProxy('scn-ok', true, [
+    { role: 'user', content: 'run it' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'call_t1', name: 'Bash', input: { command: 'ls' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_t1', content: [{ type: 'text', text: 'file1.txt' }] }] },
+  ]);
+  const msgs = upstreamBodies.at(-1)?.params?.messages || [];
+  const toolMsg = msgs.find((m) => m.role === 'tool');
+  check('文本结果完整保留', toolMsg?.content?.[0]?.output?.value === 'file1.txt', JSON.stringify(toolMsg));
+  check('未额外塞入媒体 part', toolMsg?.content?.length === 1, JSON.stringify(toolMsg));
+});
+
 await test('超限请求：返回规范 413 而不是掐断连接（曾导致客户端卡在"重连中"）', async () => {
   // 限制已收紧到 2MB，这里发 5MB
   const bigBody = JSON.stringify({

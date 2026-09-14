@@ -1306,8 +1306,9 @@ async function handleChatCompletions(req, res) {
               case 'start': case 'start-step': case 'text-start': case 'reasoning-start': case 'finish-step':
                 // Signal / bookkeeping events, no user-visible content
                 break;
-              case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-end': case 'tool-error': case 'text-end':
-                // Silent - no user-visible content
+              case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
+                // Silent - no user-visible content（清单需与流式路径一致，
+                // 漏一项就会落进 default 误报 Unknown CC event type）
                 break;
               default:
                 log('warn', 'Unknown CC event type', { type: event.type });
@@ -2284,8 +2285,9 @@ async function handleMessages(req, res) {
                 case 'start': case 'start-step': case 'text-start': case 'reasoning-start':
                   // Signal / bookkeeping events, no user-visible content
                   break;
-                case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-end': case 'tool-error': case 'text-end':
-                  // Silent - no user-visible content
+                case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
+                  // Silent - no user-visible content（清单需与流式路径一致，
+                  // 漏一项就会落进 default 误报 Unknown CC event type）
                   break;
                 default:
                   log('warn', 'Unknown CC event type', { type: event.type });
